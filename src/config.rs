@@ -53,8 +53,8 @@ pub struct AiConfig {
     pub default_search: bool,
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
-    #[serde(default = "default_history_turns", rename = "history_turns")]
-    pub legacy_history_turns: usize,
+    #[serde(default = "default_history_turns")]
+    pub history_turns: usize,
     #[serde(default = "default_true")]
     pub collapse_long_messages: bool,
     #[serde(default = "default_collapse_threshold")]
@@ -86,6 +86,12 @@ pub struct QuoteConfig {
     pub background_color: String,
     #[serde(default)]
     pub sticker_set_short_name: String,
+    #[serde(default)]
+    pub history_enabled: bool,
+    #[serde(default = "default_quote_history_limit")]
+    pub history_limit: usize,
+    #[serde(default = "default_quote_history_max_bytes")]
+    pub history_max_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -142,8 +148,8 @@ impl Config {
             if self.ai.max_concurrent == 0 {
                 bail!("ai.max_concurrent must be at least 1");
             }
-            if self.ai.legacy_history_turns > 100 {
-                bail!("ai.history_turns must be between 0 and 100");
+            if self.ai.history_turns > 20 {
+                bail!("ai.history_turns must be between 0 and 20");
             }
             if !(200..=3500).contains(&self.ai.collapse_threshold_chars) {
                 bail!("ai.collapse_threshold_chars must be between 200 and 3500");
@@ -166,6 +172,12 @@ impl Config {
             }
             if !(3..=120).contains(&self.quote.timeout_seconds) {
                 bail!("quote.timeout_seconds must be between 3 and 120 seconds");
+            }
+            if !(1..=500).contains(&self.quote.history_limit) {
+                bail!("quote.history_limit must be between 1 and 500");
+            }
+            if !(1024 * 1024..=1024 * 1024 * 1024).contains(&self.quote.history_max_bytes) {
+                bail!("quote.history_max_bytes must be between 1 MiB and 1 GiB");
             }
             let quote_url = self.quote.api_url.as_str();
             let secure = quote_url.starts_with("https://");
@@ -261,6 +273,12 @@ fn default_max_quote_messages() -> usize {
 }
 fn default_quote_background() -> String {
     "#1b1429".to_owned()
+}
+fn default_quote_history_limit() -> usize {
+    100
+}
+fn default_quote_history_max_bytes() -> usize {
+    100 * 1024 * 1024
 }
 
 #[cfg(test)]

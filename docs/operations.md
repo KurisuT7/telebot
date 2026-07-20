@@ -48,6 +48,15 @@ sudo scripts/server/rollback.sh <existing-release-id>
 
 Rollback only switches to an existing release; it never deletes state or releases.
 
+## Persistent state and backups
+
+The state database may contain an explicitly configured AI key, rolling AI context and archived
+quote media. Keep `/var/lib/telebot` and its backups owner-only. Quote history is bounded by both
+`history_limit` and `history_max_bytes`; the oldest records are removed automatically.
+
+Use SQLite online backup (or stop the service before copying the database and WAL files), then run
+`PRAGMA integrity_check` against the backup before relying on it for rollback.
+
 ## Quote renderer
 
 The quote renderer is pinned to a reviewed upstream commit and listens only on `127.0.0.1:3210`.

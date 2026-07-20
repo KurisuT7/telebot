@@ -19,7 +19,7 @@ search_fallback_model = "gemini-3.1-flash-lite"
 thinking_level = "minimal"
 default_search = true
 system_prompt = "请使用中文准确、简洁地回答。使用联网搜索时优先采用可靠来源，并明确区分事实与推断。"
-# 兼容旧配置；当前版本始终默认无记忆，只读取明确回复的消息。
+# 每个聊天的滚动上下文轮数；0 为关闭，运行时可用 .ai context 修改。
 history_turns = 0
 collapse_long_messages = true
 collapse_threshold_chars = 400
@@ -36,3 +36,7 @@ timeout_seconds = 20
 max_messages = 5
 background_color = "#1b1429"
 sticker_set_short_name = ""
+# 启用后只存档新生成的 Q；按条数和总空间自动淘汰最旧记录。
+history_enabled = false
+history_limit = 100
+history_max_bytes = 104857600

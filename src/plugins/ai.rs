@@ -9,15 +9,15 @@ use base64::Engine;
 use grammers_client::Client;
 use grammers_client::media::Media;
 use grammers_client::message::Message;
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Url};
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
 use crate::config::AiConfig;
 use crate::plugin::{CommandContext, Plugin};
-use crate::store::Store;
+use crate::store::{AiHistoryEntry, Store};
 use crate::telegram::{
     ai_rich_response, edit_progress, replace_with_chunks, replace_with_markdown,
     replace_with_rich_chunks,
@@ -27,6 +27,16 @@ const MAX_REPLY_CONTEXT_CHARS: usize = 8_000;
 const MAX_AI_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_AI_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_AI_IMAGE_TOTAL_BYTES: usize = 12 * 1024 * 1024;
+const MAX_HISTORY_ITEM_CHARS: usize = 4_000;
+const MAX_HISTORY_TOTAL_CHARS: usize = 24_000;
+const DEFAULT_CONTEXT_TURNS: usize = 6;
+const AI_SETTING_PREFIX: &str = "ai.runtime.";
+const AI_PROVIDER_SETTING: &str = "ai.runtime.provider";
+const AI_BASE_URL_SETTING: &str = "ai.runtime.base_url";
+const AI_KEY_SETTING: &str = "ai.runtime.api_key";
+const AI_MODEL_SETTING: &str = "ai.runtime.model";
+const AI_SEARCH_MODEL_SETTING: &str = "ai.runtime.search_model";
+const AI_CONTEXT_SETTING: &str = "ai.runtime.context_turns";
 
 #[derive(Clone, Debug)]
 struct AiImage {
@@ -47,6 +57,90 @@ struct GeminiAnswer {
     sources: Vec<GeminiSource>,
     model: String,
     search_calls: usize,
+}
+
+#[derive(Clone)]
+struct AiRuntimeOptions {
+    provider_name: String,
+    base_url: String,
+    api_key: String,
+    primary_model: String,
+    search_fallback_model: String,
+    context_turns: usize,
+    key_overridden: bool,
+}
+
+#[derive(Clone)]
+struct AiRuntime {
+    provider_name: String,
+    base_url: String,
+    api_key: String,
+    primary_model: String,
+    search_fallback_model: String,
+    context_turns: usize,
+    key_overridden: bool,
+    provider: GeminiProvider,
+}
+
+impl From<&AiRuntime> for AiRuntimeOptions {
+    fn from(runtime: &AiRuntime) -> Self {
+        Self {
+            provider_name: runtime.provider_name.clone(),
+            base_url: runtime.base_url.clone(),
+            api_key: runtime.api_key.clone(),
+            primary_model: runtime.primary_model.clone(),
+            search_fallback_model: runtime.search_fallback_model.clone(),
+            context_turns: runtime.context_turns,
+            key_overridden: runtime.key_overridden,
+        }
+    }
+}
+
+impl AiRuntime {
+    fn build(config: &AiConfig, options: AiRuntimeOptions) -> Result<Self> {
+        let AiRuntimeOptions {
+            provider_name,
+            base_url,
+            api_key,
+            primary_model,
+            search_fallback_model,
+            context_turns,
+            key_overridden,
+        } = options;
+        validate_provider_name(&provider_name)?;
+        let base_url = normalize_base_url(&base_url)?;
+        validate_api_key(&api_key)?;
+        validate_model("主模型", &primary_model)?;
+        validate_model("搜索备用模型", &search_fallback_model)?;
+        if context_turns > 20 {
+            bail!("上下文轮数必须在 0 到 20 之间");
+        }
+        let provider = GeminiProvider::new_runtime(
+            config,
+            &base_url,
+            &primary_model,
+            &search_fallback_model,
+            api_key.clone(),
+        )?;
+        Ok(Self {
+            provider_name,
+            base_url,
+            api_key,
+            primary_model,
+            search_fallback_model,
+            context_turns,
+            key_overridden,
+            provider,
+        })
+    }
+}
+
+fn default_provider_name(config: &AiConfig) -> String {
+    if config.provider.eq_ignore_ascii_case("gemini") {
+        "Gemini".to_owned()
+    } else {
+        config.provider.clone()
+    }
 }
 
 pub async fn check_provider(config: &AiConfig, api_key: String) -> Result<()> {
@@ -79,18 +173,54 @@ pub async fn check_provider(config: &AiConfig, api_key: String) -> Result<()> {
 
 pub struct AiPlugin {
     config: AiConfig,
-    provider: GeminiProvider,
+    env_api_key: String,
+    runtime: RwLock<AiRuntime>,
     store: Arc<Store>,
     capacity: Arc<Semaphore>,
 }
 
 impl AiPlugin {
-    pub fn new(config: AiConfig, api_key: String, store: Arc<Store>) -> Result<Self> {
-        let provider = GeminiProvider::new(&config, api_key)?;
+    pub async fn new(config: AiConfig, env_api_key: String, store: Arc<Store>) -> Result<Self> {
+        let provider_name = store
+            .get_setting(AI_PROVIDER_SETTING)
+            .await?
+            .unwrap_or_else(|| default_provider_name(&config));
+        let base_url = store
+            .get_setting(AI_BASE_URL_SETTING)
+            .await?
+            .unwrap_or_else(|| config.base_url.clone());
+        let key_override = store.get_setting(AI_KEY_SETTING).await?;
+        let key_overridden = key_override.is_some();
+        let api_key = key_override.unwrap_or_else(|| env_api_key.clone());
+        let primary_model = store
+            .get_setting(AI_MODEL_SETTING)
+            .await?
+            .unwrap_or_else(|| config.model.clone());
+        let search_fallback_model = store
+            .get_setting(AI_SEARCH_MODEL_SETTING)
+            .await?
+            .unwrap_or_else(|| config.search_fallback_model.clone());
+        let context_turns = match store.get_setting(AI_CONTEXT_SETTING).await? {
+            Some(value) => parse_context_turns(&value)?,
+            None => config.history_turns,
+        };
+        let runtime = AiRuntime::build(
+            &config,
+            AiRuntimeOptions {
+                provider_name,
+                base_url,
+                api_key,
+                primary_model,
+                search_fallback_model,
+                context_turns,
+                key_overridden,
+            },
+        )?;
         Ok(Self {
             capacity: Arc::new(Semaphore::new(config.max_concurrent)),
             config,
-            provider,
+            env_api_key,
+            runtime: RwLock::new(runtime),
             store,
         })
     }
@@ -109,15 +239,20 @@ impl AiPlugin {
             .acquire()
             .await
             .map_err(|_| anyhow!("AI worker pool is shutting down"))?;
-        // Normal AI requests are intentionally stateless. The only context comes from the
-        // message explicitly replied to by this command.
+        let runtime = self.runtime.read().await.clone();
+        let history = self
+            .store
+            .ai_history(&scope, runtime.context_turns.saturating_mul(2))
+            .await?;
+        let prompt = compose_history_prompt(&history, &prompt);
         let started = Instant::now();
         let (answer, searched) = if use_search {
-            self.answer_with_native_search(&prompt, &images, &scope)
+            self.answer_with_native_search(&runtime.provider, &prompt, &images, &scope)
                 .await?
         } else {
             (
-                self.provider
+                runtime
+                    .provider
                     .generate_chat_with_timeout(
                         &prompt,
                         &images,
@@ -131,7 +266,7 @@ impl AiPlugin {
         let rich = ai_rich_response(
             &question,
             &answer,
-            "Gemini",
+            &runtime.provider_name,
             if self.config.collapse_long_messages {
                 self.config.collapse_threshold_chars
             } else {
@@ -139,9 +274,24 @@ impl AiPlugin {
             },
         );
         replace_with_rich_chunks(&context.client, &context.message, &rich).await?;
+        if runtime.context_turns > 0
+            && let Err(error) = self
+                .store
+                .append_ai_turn(
+                    &scope,
+                    &truncate_history_item(&question),
+                    &truncate_history_item(&answer),
+                    runtime.context_turns,
+                )
+                .await
+        {
+            warn!(%error, scope, "failed to persist AI context");
+        }
         info!(
             scope,
+            provider = runtime.provider_name,
             searched,
+            context_turns = runtime.context_turns,
             elapsed_ms = started.elapsed().as_millis(),
             "AI request completed"
         );
@@ -150,12 +300,12 @@ impl AiPlugin {
 
     async fn answer_with_native_search(
         &self,
+        provider: &GeminiProvider,
         prompt: &str,
         images: &[AiImage],
         scope: &str,
     ) -> Result<(String, bool)> {
-        match self
-            .provider
+        match provider
             .generate_search_hedged(
                 prompt,
                 images,
@@ -177,8 +327,7 @@ impl AiPlugin {
             }
             Err(search_error) => {
                 warn!(error = %search_error, scope, "Gemini native search models failed; using non-search fallback");
-                let fallback = self
-                    .provider
+                let fallback = provider
                     .generate_chat_with_timeout(
                         prompt,
                         images,
@@ -193,17 +342,31 @@ impl AiPlugin {
         }
     }
 
-    fn status_text(&self) -> String {
+    async fn status_text(&self) -> String {
+        let runtime = self.runtime.read().await;
+        let context = if runtime.context_turns == 0 {
+            "关闭".to_owned()
+        } else {
+            format!("开启（{} 轮）", runtime.context_turns)
+        };
         format!(
-            "🤖 **telebot AI**\n\n- 服务商：`Gemini`\n- 主模型：`{}`\n- 原生搜索备用模型：`{}`\n- 原生搜索：`Google Search / Interactions API`\n- 思考等级：`{}`\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**关闭**\n- 回复消息：仅作为本次请求上下文\n- 长文折叠：{}（{} 字起）\n- 原生搜索总时限：{} 秒\n- 慢请求切备用模型：{} 秒\n- 无搜索兜底时限：{} 秒\n- 并发上限：{}",
-            self.config.model,
-            self.config.search_fallback_model,
+            "🤖 **telebot AI**\n\n- 服务商：`{}`（Gemini 兼容）\n- BaseURL：`{}`\n- Key：**{}**\n- 主模型：`{}`\n- 原生搜索备用模型：`{}`\n- 原生搜索：`Google Search / Interactions API`\n- 思考等级：`{}`\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**{}**\n- 回复消息：作为本次请求上下文\n- 长文折叠：{}（{} 字起）\n- 原生搜索总时限：{} 秒\n- 慢请求切备用模型：{} 秒\n- 无搜索兜底时限：{} 秒\n- 并发上限：{}",
+            runtime.provider_name,
+            runtime.base_url,
+            if runtime.key_overridden {
+                "已设置自定义 Key"
+            } else {
+                "使用服务器环境变量"
+            },
+            runtime.primary_model,
+            runtime.search_fallback_model,
             self.config.thinking_level,
             if self.config.default_search {
                 "开启"
             } else {
                 "关闭"
             },
+            context,
             if self.config.collapse_long_messages {
                 "开启"
             } else {
@@ -221,9 +384,194 @@ impl AiPlugin {
         replace_with_markdown(
             &context.client,
             &context.message,
-            "# 🤖 telebot AI\n\n- `.ai <问题>` — 默认联网搜索\n- `.ai` — 回复消息时直接分析被回复内容\n- `.ai search <问题>` — 强制联网搜索\n- `.ai chat <问题>` — 不联网回答\n- `.ai status` — 查看当前配置\n- `.ai reset` — 清除旧版本遗留上下文\n\n> 默认不保存对话历史；只有你明确回复的消息会作为本次上下文。",
+            "# 🤖 telebot AI\n\n- `.ai <问题>` — 默认联网搜索\n- `.ai` — 回复消息时直接分析被回复内容\n- `.ai search <问题>` — 强制联网搜索\n- `.ai chat <问题>` — 不联网回答\n- `.ai status` / `.ai config` — 查看当前配置\n- `.ai config provider <名称> <BaseURL>` — 设置 Gemini 兼容服务商\n- `.ai config key <Key>` — 设置 Key（仅收藏夹）\n- `.ai config model <主模型> [搜索备用模型]`\n- `.ai context <0-20|on|off>` — 配置按聊天保存的上下文\n- `.ai config reset` — 恢复服务器配置\n- `.ai reset` — 清除当前聊天上下文\n\n> 配置修改仅允许在收藏夹执行；Key 不会回显。上下文默认关闭。",
         )
         .await
+    }
+
+    async fn ensure_saved_messages(&self, context: &CommandContext) -> Result<()> {
+        let me = context.client.get_me().await?;
+        if context.message.peer_id() != me.id() {
+            bail!("为避免泄露配置，请只在 Telegram 收藏夹中执行 AI 配置修改");
+        }
+        Ok(())
+    }
+
+    async fn context_command(&self, context: &CommandContext, args: &[String]) -> Result<()> {
+        if args.is_empty() {
+            let turns = self.runtime.read().await.context_turns;
+            let message = if turns == 0 {
+                "🧠 自动上下文：关闭\n设置：.ai context on 或 .ai context <1-20>".to_owned()
+            } else {
+                format!("🧠 自动上下文：开启（{turns} 轮）\n关闭：.ai context off")
+            };
+            return replace_with_chunks(&context.client, &context.message, &message).await;
+        }
+        self.ensure_saved_messages(context).await?;
+        if args.len() != 1 {
+            bail!("用法：.ai context <0-20|on|off>");
+        }
+        let turns = match args[0].to_ascii_lowercase().as_str() {
+            "on" => DEFAULT_CONTEXT_TURNS,
+            "off" => 0,
+            value => parse_context_turns(value)?,
+        };
+        self.store
+            .set_setting(AI_CONTEXT_SETTING, &turns.to_string())
+            .await?;
+        self.runtime.write().await.context_turns = turns;
+        let message = if turns == 0 {
+            "✅ 自动上下文已关闭；已有记录可用 .ai reset 清除".to_owned()
+        } else {
+            format!("✅ 自动上下文已设置为 {turns} 轮（按聊天独立保存）")
+        };
+        replace_with_chunks(&context.client, &context.message, &message).await
+    }
+
+    async fn config_command(&self, context: &CommandContext, args: &[String]) -> Result<()> {
+        if args.is_empty() || args[0].eq_ignore_ascii_case("status") {
+            return replace_with_markdown(
+                &context.client,
+                &context.message,
+                &self.status_text().await,
+            )
+            .await;
+        }
+        let action = args[0].to_ascii_lowercase();
+        if action == "context" {
+            return self.context_command(context, &args[1..]).await;
+        }
+        if action == "key" {
+            edit_progress(&context.message, "🔐 正在安全更新 AI Key…").await?;
+        }
+        self.ensure_saved_messages(context).await?;
+        match action.as_str() {
+            "provider" => {
+                if args.len() != 3 {
+                    bail!("用法：.ai config provider <名称> <BaseURL>");
+                }
+                let current = self.runtime.read().await.clone();
+                let updated = AiRuntime::build(
+                    &self.config,
+                    AiRuntimeOptions {
+                        provider_name: args[1].clone(),
+                        base_url: args[2].clone(),
+                        api_key: current.api_key,
+                        primary_model: current.primary_model,
+                        search_fallback_model: current.search_fallback_model,
+                        context_turns: current.context_turns,
+                        key_overridden: current.key_overridden,
+                    },
+                )?;
+                self.store
+                    .set_setting(AI_PROVIDER_SETTING, &updated.provider_name)
+                    .await?;
+                self.store
+                    .set_setting(AI_BASE_URL_SETTING, &updated.base_url)
+                    .await?;
+                let message = format!(
+                    "✅ 服务商已设置为 {}\nBaseURL：{}",
+                    updated.provider_name, updated.base_url
+                );
+                *self.runtime.write().await = updated;
+                replace_with_chunks(&context.client, &context.message, &message).await
+            }
+            "key" => {
+                if args.len() != 2 {
+                    bail!("用法：.ai config key <Key>");
+                }
+                validate_api_key(&args[1])?;
+                let current = self.runtime.read().await.clone();
+                let updated = AiRuntime::build(
+                    &self.config,
+                    AiRuntimeOptions {
+                        api_key: args[1].clone(),
+                        key_overridden: true,
+                        ..AiRuntimeOptions::from(&current)
+                    },
+                )?;
+                self.store.set_setting(AI_KEY_SETTING, &args[1]).await?;
+                *self.runtime.write().await = updated;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    "✅ AI Key 已更新并持久化；不会回显 Key",
+                )
+                .await
+            }
+            "clear-key" | "env-key" => {
+                let current = self.runtime.read().await.clone();
+                let updated = AiRuntime::build(
+                    &self.config,
+                    AiRuntimeOptions {
+                        api_key: self.env_api_key.clone(),
+                        key_overridden: false,
+                        ..AiRuntimeOptions::from(&current)
+                    },
+                )?;
+                self.store.delete_setting(AI_KEY_SETTING).await?;
+                *self.runtime.write().await = updated;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    "✅ 已改回服务器环境变量中的 AI Key",
+                )
+                .await
+            }
+            "model" => {
+                if !(2..=3).contains(&args.len()) {
+                    bail!("用法：.ai config model <主模型> [搜索备用模型]");
+                }
+                let current = self.runtime.read().await.clone();
+                let search_model = args
+                    .get(2)
+                    .cloned()
+                    .unwrap_or_else(|| current.search_fallback_model.clone());
+                let updated = AiRuntime::build(
+                    &self.config,
+                    AiRuntimeOptions {
+                        primary_model: args[1].clone(),
+                        search_fallback_model: search_model,
+                        ..AiRuntimeOptions::from(&current)
+                    },
+                )?;
+                self.store
+                    .set_setting(AI_MODEL_SETTING, &updated.primary_model)
+                    .await?;
+                self.store
+                    .set_setting(AI_SEARCH_MODEL_SETTING, &updated.search_fallback_model)
+                    .await?;
+                let message = format!(
+                    "✅ AI 模型已更新\n主模型：{}\n搜索备用：{}",
+                    updated.primary_model, updated.search_fallback_model
+                );
+                *self.runtime.write().await = updated;
+                replace_with_chunks(&context.client, &context.message, &message).await
+            }
+            "reset" => {
+                let updated = AiRuntime::build(
+                    &self.config,
+                    AiRuntimeOptions {
+                        provider_name: default_provider_name(&self.config),
+                        base_url: self.config.base_url.clone(),
+                        api_key: self.env_api_key.clone(),
+                        primary_model: self.config.model.clone(),
+                        search_fallback_model: self.config.search_fallback_model.clone(),
+                        context_turns: self.config.history_turns,
+                        key_overridden: false,
+                    },
+                )?;
+                self.store.delete_settings_prefix(AI_SETTING_PREFIX).await?;
+                *self.runtime.write().await = updated;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    "✅ AI 动态配置已清除，已恢复服务器配置",
+                )
+                .await
+            }
+            _ => bail!("未知配置项；可用：provider、key、clear-key、model、context、reset"),
+        }
     }
 }
 
@@ -232,37 +580,49 @@ impl Plugin for AiPlugin {
     fn name(&self) -> &'static str {
         "ai"
     }
+
     fn commands(&self) -> &'static [&'static str] {
         &["ai"]
     }
 
     async fn handle(&self, context: CommandContext) -> Result<()> {
         let raw = context.command.raw_args.trim();
-        if raw.eq_ignore_ascii_case("help") || raw == "?" {
-            return self.show_help(&context).await;
-        }
-
-        if raw.eq_ignore_ascii_case("status") || raw.eq_ignore_ascii_case("config") {
-            return replace_with_markdown(&context.client, &context.message, &self.status_text())
-                .await;
-        }
-
-        if raw.eq_ignore_ascii_case("reset") || raw.eq_ignore_ascii_case("clear") {
-            let deleted = self
-                .store
-                .clear_history(&context.message.peer_id().to_string())
-                .await?;
-            return replace_with_chunks(
-                &context.client,
-                &context.message,
-                &format!(
-                    "✅ 已清除旧版本遗留上下文（{deleted} 条记录）\n\n当前版本默认不保存上下文。"
-                ),
-            )
-            .await;
-        }
-
         let (first, rest) = split_first(raw);
+        match first.to_ascii_lowercase().as_str() {
+            "help" | "?" => return self.show_help(&context).await,
+            "status" => {
+                return replace_with_markdown(
+                    &context.client,
+                    &context.message,
+                    &self.status_text().await,
+                )
+                .await;
+            }
+            "config" | "cfg" => {
+                return self
+                    .config_command(&context, &context.command.args[1..])
+                    .await;
+            }
+            "context" | "ctx" => {
+                return self
+                    .context_command(&context, &context.command.args[1..])
+                    .await;
+            }
+            "reset" | "clear" => {
+                let deleted = self
+                    .store
+                    .clear_history(&context.message.peer_id().to_string())
+                    .await?;
+                return replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    &format!("✅ 已清除当前聊天上下文（{deleted} 条记录）"),
+                )
+                .await;
+            }
+            _ => {}
+        }
+
         let (use_search, explicit_question) = match first.to_ascii_lowercase().as_str() {
             "search" | "s" => (true, rest.to_owned()),
             "chat" | "c" => (false, rest.to_owned()),
@@ -322,6 +682,107 @@ impl Plugin for AiPlugin {
         self.answer(&context, question, prompt, use_search, images)
             .await
     }
+}
+
+fn validate_provider_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 32
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        bail!("服务商名称只能包含字母、数字、点、横线和下划线，且不超过 32 字符");
+    }
+    Ok(())
+}
+
+fn normalize_base_url(value: &str) -> Result<String> {
+    let value = value.trim().trim_end_matches('/');
+    if value.len() > 256 {
+        bail!("BaseURL 过长");
+    }
+    let parsed = Url::parse(value).context("BaseURL 无效")?;
+    let loopback = parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+    });
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        bail!("BaseURL 必须使用 HTTPS；只有本机回环地址可使用 HTTP");
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("BaseURL 不能包含账号、查询参数或片段");
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_api_key(value: &str) -> Result<()> {
+    if value.trim().is_empty() || value.len() > 1024 || value.chars().any(char::is_whitespace) {
+        bail!("AI Key 不能为空、不能包含空白，且不能超过 1024 字符");
+    }
+    Ok(())
+}
+
+fn validate_model(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/'))
+    {
+        bail!("{label}名称包含不支持的字符");
+    }
+    Ok(())
+}
+
+fn parse_context_turns(value: &str) -> Result<usize> {
+    let turns = value.parse::<usize>().context("上下文轮数必须是数字")?;
+    if turns > 20 {
+        bail!("上下文轮数必须在 0 到 20 之间");
+    }
+    Ok(turns)
+}
+
+fn truncate_history_item(value: &str) -> String {
+    let mut output = value
+        .chars()
+        .take(MAX_HISTORY_ITEM_CHARS)
+        .collect::<String>();
+    if value.chars().count() > MAX_HISTORY_ITEM_CHARS {
+        output.push_str("\n…（历史内容已截断）");
+    }
+    output
+}
+
+fn compose_history_prompt(history: &[AiHistoryEntry], current: &str) -> String {
+    if history.is_empty() {
+        return current.to_owned();
+    }
+    let mut entries = history
+        .iter()
+        .map(|entry| {
+            let role = if entry.role == "assistant" {
+                "助手"
+            } else {
+                "用户"
+            };
+            format!("{role}：{}", truncate_history_item(&entry.content))
+        })
+        .collect::<Vec<_>>();
+    let mut total = entries
+        .iter()
+        .map(|entry| entry.chars().count())
+        .sum::<usize>();
+    while total > MAX_HISTORY_TOTAL_CHARS && entries.len() > 1 {
+        total = total.saturating_sub(entries.remove(0).chars().count());
+    }
+    format!(
+        "以下是同一聊天中最近的对话历史，仅用于理解上下文：\n\n{}\n\n当前请求：\n{}",
+        entries.join("\n\n"),
+        current
+    )
 }
 
 fn offline_fallback_answer(answer: String) -> String {
@@ -469,6 +930,7 @@ fn truncate_chars(input: &str, max: usize) -> String {
     }
 }
 
+#[derive(Clone)]
 struct GeminiProvider {
     http: reqwest::Client,
     endpoint: String,
@@ -482,24 +944,31 @@ struct GeminiProvider {
 
 impl GeminiProvider {
     fn new(config: &AiConfig, api_key: String) -> Result<Self> {
-        for (name, model) in [
-            ("ai.model", config.model.as_str()),
-            (
-                "ai.search_fallback_model",
-                config.search_fallback_model.as_str(),
-            ),
-        ] {
-            if !model
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-            {
-                bail!("{name} contains unsupported characters");
-            }
-        }
-        let endpoint = format!(
-            "{}/v1beta/interactions",
-            config.base_url.trim_end_matches('/')
-        );
+        Self::new_runtime(
+            config,
+            &config.base_url,
+            &config.model,
+            &config.search_fallback_model,
+            api_key,
+        )
+    }
+
+    fn new_runtime(
+        config: &AiConfig,
+        base_url: &str,
+        primary_model: &str,
+        search_fallback_model: &str,
+        api_key: String,
+    ) -> Result<Self> {
+        validate_model("ai.model", primary_model)?;
+        validate_model("ai.search_fallback_model", search_fallback_model)?;
+        validate_api_key(&api_key)?;
+        let base_url = normalize_base_url(base_url)?;
+        let endpoint = if base_url.ends_with("/v1beta") {
+            format!("{base_url}/interactions")
+        } else {
+            format!("{base_url}/v1beta/interactions")
+        };
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(60))
@@ -512,8 +981,8 @@ impl GeminiProvider {
             endpoint,
             api_key,
             system_prompt: config.system_prompt.clone(),
-            primary_model: config.model.clone(),
-            search_fallback_model: config.search_fallback_model.clone(),
+            primary_model: primary_model.to_owned(),
+            search_fallback_model: search_fallback_model.to_owned(),
             thinking_level: config.thinking_level.clone(),
             max_output_tokens: config.max_output_tokens,
         })
@@ -883,5 +1352,38 @@ mod tests {
         append_sources(&mut answer, &sources);
         assert!(answer.contains("### 🔗 来源"));
         assert!(answer.contains("[Windows local account guide]"));
+    }
+
+    #[test]
+    fn runtime_base_url_is_restricted_and_normalized() {
+        assert_eq!(
+            normalize_base_url("https://example.com/gemini/").unwrap(),
+            "https://example.com/gemini"
+        );
+        assert_eq!(
+            normalize_base_url("http://127.0.0.1:8080").unwrap(),
+            "http://127.0.0.1:8080"
+        );
+        assert!(normalize_base_url("http://example.com").is_err());
+        assert!(normalize_base_url("https://user@example.com").is_err());
+        assert!(normalize_base_url("https://example.com?token=secret").is_err());
+    }
+
+    #[test]
+    fn rolling_history_is_added_before_current_prompt() {
+        let history = vec![
+            AiHistoryEntry {
+                role: "user".to_owned(),
+                content: "第一问".to_owned(),
+            },
+            AiHistoryEntry {
+                role: "assistant".to_owned(),
+                content: "第一答".to_owned(),
+            },
+        ];
+        let prompt = compose_history_prompt(&history, "第二问");
+        assert!(prompt.contains("用户：第一问"));
+        assert!(prompt.contains("助手：第一答"));
+        assert!(prompt.ends_with("当前请求：\n第二问"));
     }
 }

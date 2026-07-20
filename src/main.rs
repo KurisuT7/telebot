@@ -168,7 +168,8 @@ async fn check_telegram_plugins(config_path: &Path) -> Result<()> {
             config.ai.clone(),
             secrets.ai_api_key.context("AI key is missing")?,
             Arc::clone(&store),
-        )?;
+        )
+        .await?;
         let ai_result = ai
             .handle(CommandContext {
                 client: client.clone(),
@@ -463,26 +464,27 @@ fn raw_command_candidates(
 }
 
 fn command_progress_text(command: &Command, default_search: bool) -> Option<&'static str> {
-    let raw = command.raw_args.trim();
-    let first = raw.split_whitespace().next().unwrap_or("");
+    let mut parts = command.raw_args.split_whitespace();
+    let first = parts.next().unwrap_or("").to_ascii_lowercase();
+    let second = parts.next().unwrap_or("").to_ascii_lowercase();
     match command.name.as_str() {
-        "ai" if raw.eq_ignore_ascii_case("help")
-            || raw == "?"
-            || raw.eq_ignore_ascii_case("status")
-            || raw.eq_ignore_ascii_case("config")
-            || raw.eq_ignore_ascii_case("reset")
-            || raw.eq_ignore_ascii_case("clear") =>
+        "ai" if matches!(first.as_str(), "config" | "cfg") && second == "key" => {
+            Some("🔐 正在安全更新 AI 配置…")
+        }
+        "ai" if matches!(
+            first.as_str(),
+            "help" | "?" | "status" | "config" | "cfg" | "context" | "ctx" | "reset" | "clear"
+        ) =>
         {
             None
         }
-        "ai" if matches!(first.to_ascii_lowercase().as_str(), "chat" | "c") => Some("💭 正在思考…"),
-        "ai" if matches!(first.to_ascii_lowercase().as_str(), "search" | "s") => {
-            Some("🔎 正在联网搜索…")
-        }
+        "ai" if matches!(first.as_str(), "chat" | "c") => Some("💭 正在思考…"),
+        "ai" if matches!(first.as_str(), "search" | "s") => Some("🔎 正在联网搜索…"),
         "ai" if default_search => Some("🔎 正在联网搜索…"),
         "ai" => Some("💭 正在思考…"),
-        "q" if matches!(first.to_ascii_lowercase().as_str(), "config" | "help" | "h") => None,
-        "q" if first.eq_ignore_ascii_case("s") => Some("📦 正在保存到贴纸包…"),
+        "q" if matches!(first.as_str(), "config" | "help" | "h") => None,
+        "q" if matches!(first.as_str(), "history" | "his") => Some("🗂️ 正在读取语录存档…"),
+        "q" if first == "s" => Some("📦 正在保存到贴纸包…"),
         "q" => Some("🖼️ 正在生成语录贴纸…"),
         _ => None,
     }
@@ -624,11 +626,14 @@ async fn serve(config_path: &Path) -> Result<()> {
 
     let mut router = Router::default();
     if config.ai.enabled {
-        router.register(Arc::new(AiPlugin::new(
-            config.ai.clone(),
-            secrets.ai_api_key.expect("AI key checked by config"),
-            Arc::clone(&store),
-        )?))?;
+        router.register(Arc::new(
+            AiPlugin::new(
+                config.ai.clone(),
+                secrets.ai_api_key.expect("AI key checked by config"),
+                Arc::clone(&store),
+            )
+            .await?,
+        ))?;
     }
     if config.quote.enabled {
         router.register(Arc::new(QuotePlugin::new(
@@ -799,7 +804,10 @@ fn user_facing_error(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerId, UpdatesLike, command_belongs_to_self, raw_command_candidates, tl};
+    use super::{
+        Command, PeerId, UpdatesLike, command_belongs_to_self, command_progress_text,
+        raw_command_candidates, tl,
+    };
 
     fn short_message(out: bool, user_id: i64, text: &str) -> UpdatesLike {
         UpdatesLike::Updates(tl::enums::Updates::UpdateShortMessage(
@@ -844,6 +852,43 @@ mod tests {
         assert!(
             raw_command_candidates(&short_message(false, 99, ".ai ignored"), self_id, &prefixes,)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn fast_progress_redacts_keys_and_labels_history() {
+        let key_command = Command {
+            prefix: ".".to_owned(),
+            name: "ai".to_owned(),
+            raw_args: "config key very-secret".to_owned(),
+            args: vec![
+                "config".to_owned(),
+                "key".to_owned(),
+                "very-secret".to_owned(),
+            ],
+        };
+        assert_eq!(
+            command_progress_text(&key_command, true),
+            Some("🔐 正在安全更新 AI 配置…")
+        );
+
+        let context_command = Command {
+            prefix: ".".to_owned(),
+            name: "ai".to_owned(),
+            raw_args: "context 6".to_owned(),
+            args: vec!["context".to_owned(), "6".to_owned()],
+        };
+        assert_eq!(command_progress_text(&context_command, true), None);
+
+        let history_command = Command {
+            prefix: ".".to_owned(),
+            name: "q".to_owned(),
+            raw_args: "history 1".to_owned(),
+            args: vec!["history".to_owned(), "1".to_owned()],
+        };
+        assert_eq!(
+            command_progress_text(&history_command, true),
+            Some("🗂️ 正在读取语录存档…")
         );
     }
 }

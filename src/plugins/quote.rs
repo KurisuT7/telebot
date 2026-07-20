@@ -29,8 +29,11 @@ use crate::telegram::{
 };
 
 const STICKER_SET_SETTING: &str = "quote.sticker_set_short_name";
+const HISTORY_ENABLED_SETTING: &str = "quote.history.enabled";
+const HISTORY_LIMIT_SETTING: &str = "quote.history.limit";
 const MAX_MEDIA_BYTES: u64 = 12 * 1024 * 1024;
 const MAX_QUOTE_RESPONSE_BYTES: usize = 12 * 1024 * 1024;
+const MAX_HISTORY_PREVIEW_CHARS: usize = 180;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QuoteOutput {
@@ -59,6 +62,31 @@ impl QuoteOutput {
         match self {
             Self::Sticker | Self::Image => (512, 768),
             Self::Stories => (360, 640),
+        }
+    }
+
+    fn history_kind(self) -> &'static str {
+        match self {
+            Self::Sticker => "sticker",
+            Self::Image => "image",
+            Self::Stories => "stories",
+        }
+    }
+
+    fn from_history_kind(value: &str) -> Result<Self> {
+        match value {
+            "sticker" => Ok(Self::Sticker),
+            "image" => Ok(Self::Image),
+            "stories" => Ok(Self::Stories),
+            _ => bail!("存档格式无效"),
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Sticker => "贴纸",
+            Self::Image => "图片",
+            Self::Stories => "故事图",
         }
     }
 }
@@ -131,6 +159,107 @@ impl QuotePlugin {
             .unwrap_or_else(|| self.config.sticker_set_short_name.clone()))
     }
 
+    async fn history_enabled(&self) -> Result<bool> {
+        match self.store.get_setting(HISTORY_ENABLED_SETTING).await? {
+            Some(value) => parse_history_enabled(&value),
+            None => Ok(self.config.history_enabled),
+        }
+    }
+
+    async fn history_limit(&self) -> Result<usize> {
+        let limit = match self.store.get_setting(HISTORY_LIMIT_SETTING).await? {
+            Some(value) => value.parse::<usize>().context("语录存档数量必须是数字")?,
+            None => self.config.history_limit,
+        };
+        if !(1..=500).contains(&limit) {
+            bail!("语录存档数量必须在 1 到 500 之间");
+        }
+        Ok(limit)
+    }
+
+    async fn archive_quote(&self, output: QuoteOutput, preview: &str, bytes: &[u8]) -> Result<()> {
+        if !self.history_enabled().await? {
+            return Ok(());
+        }
+        let limit = self.history_limit().await?;
+        let id = self
+            .store
+            .add_quote_history(
+                output.history_kind(),
+                preview,
+                bytes,
+                limit,
+                self.config.history_max_bytes,
+            )
+            .await?;
+        info!(
+            history_id = id,
+            output = output.history_kind(),
+            bytes = bytes.len(),
+            "quote archived"
+        );
+        Ok(())
+    }
+
+    async fn history_command(&self, context: &CommandContext, args: &[String]) -> Result<()> {
+        if args.is_empty() {
+            let entries = self.store.quote_history(10).await?;
+            if entries.is_empty() {
+                return replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    "🗂️ 暂无语录存档。启用后，新生成的 `.q` 会自动保存。",
+                )
+                .await;
+            }
+            let mut lines = vec!["🗂️ 最近的语录存档".to_owned()];
+            for entry in entries {
+                let output = QuoteOutput::from_history_kind(&entry.output)?;
+                lines.push(format!(
+                    "#{} · {} · {}\n{}",
+                    entry.id,
+                    output.display_name(),
+                    format_byte_size(entry.byte_len),
+                    entry.preview
+                ));
+            }
+            lines.push("取回：.q history <ID>".to_owned());
+            return replace_with_chunks(&context.client, &context.message, &lines.join("\n\n"))
+                .await;
+        }
+        if args.len() != 1 {
+            bail!("用法：.q history [ID]");
+        }
+        let id = args[0].parse::<i64>().context("存档 ID 必须是数字")?;
+        if id <= 0 {
+            bail!("存档 ID 必须大于 0");
+        }
+        edit_progress(&context.message, "🗂️ 正在读取语录存档…").await?;
+        let entry = self
+            .store
+            .quote_history_entry(id)
+            .await?
+            .ok_or_else(|| anyhow!("未找到语录存档 #{id}"))?;
+        let output = QuoteOutput::from_history_kind(&entry.output)?;
+        match output {
+            QuoteOutput::Sticker => {
+                send_sticker_bytes(&context.client, &context.message, &entry.media, None).await?
+            }
+            QuoteOutput::Image | QuoteOutput::Stories => {
+                send_photo_bytes(&context.client, &context.message, &entry.media, None).await?
+            }
+        }
+        context.message.delete().await?;
+        info!(
+            history_id = entry.id,
+            created_at = entry.created_at,
+            output = entry.output,
+            preview = entry.preview,
+            "quote history resent"
+        );
+        Ok(())
+    }
+
     async fn generate_quote(
         &self,
         context: &CommandContext,
@@ -175,6 +304,7 @@ impl QuotePlugin {
         let mut previous_sender = None;
         let mut avatar_count = 0usize;
         let mut payload_messages = Vec::with_capacity(messages.len());
+        let mut preview_lines = Vec::with_capacity(messages.len());
         for (index, message) in messages.iter().enumerate() {
             let sender = sender_view(message);
             let sender_id = sender.id;
@@ -201,6 +331,12 @@ impl QuotePlugin {
                     convert_entities(message.fmt_entities()),
                 )
             };
+            preview_lines.push(format!(
+                "{}：{}",
+                sender.display_name,
+                quote_preview_line(&text)
+            ));
+
             let reply_message = if include_replies {
                 build_reply_block(message).await
             } else {
@@ -238,11 +374,27 @@ impl QuotePlugin {
         let bytes = self.request_quote(&payload, output).await?;
         match output {
             QuoteOutput::Sticker => {
-                send_sticker_bytes(&context.client, &context.message, &bytes, replied.id()).await?
+                send_sticker_bytes(
+                    &context.client,
+                    &context.message,
+                    &bytes,
+                    Some(replied.id()),
+                )
+                .await?
             }
             QuoteOutput::Image | QuoteOutput::Stories => {
-                send_photo_bytes(&context.client, &context.message, &bytes, replied.id()).await?
+                send_photo_bytes(
+                    &context.client,
+                    &context.message,
+                    &bytes,
+                    Some(replied.id()),
+                )
+                .await?
             }
+        }
+        let preview = quote_history_preview(&preview_lines);
+        if let Err(error) = self.archive_quote(output, &preview, &bytes).await {
+            warn!(%error, "failed to archive quote; generated media was still sent");
         }
         context.message.delete().await?;
         info!(
@@ -472,26 +624,82 @@ impl QuotePlugin {
             } else {
                 format!("\n链接：https://t.me/addstickers/{name}")
             };
+            let enabled = self.history_enabled().await?;
+            let limit = self.history_limit().await?;
+            let entries = self.store.quote_history(limit).await?;
+            let used_bytes = entries.iter().map(|entry| entry.byte_len).sum::<usize>();
             return replace_with_chunks(
                 &context.client,
                 &context.message,
-                &format!("📋 语录配置\n\n贴纸包：{value}{link}\n\n设置：.q config sticker <名称>"),
+                &format!(
+                    "📋 语录配置\n\n贴纸包：{value}{link}\n存档：{}\n存档数量：{}/{}\n存档空间：{}/{}\n\n设置贴纸包：.q config sticker <名称>\n开关存档：.q config history on|off\n存档上限：.q config history limit <1-500>",
+                    if enabled { "开启" } else { "关闭" },
+                    entries.len(),
+                    limit,
+                    format_byte_size(used_bytes),
+                    format_byte_size(self.config.history_max_bytes),
+                ),
             )
             .await;
         }
         let key = args[0].to_ascii_lowercase();
-        if !matches!(key.as_str(), "sticker" | "stickerset" | "set") {
-            bail!("未知配置项；可用命令：.q config sticker <名称>");
+        match key.as_str() {
+            "sticker" | "stickerset" | "set" => {
+                let name = args[1..].join("_");
+                validate_sticker_set_name(&name)?;
+                self.store.set_setting(STICKER_SET_SETTING, &name).await?;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    &format!("✅ 贴纸包已设置为 {name}\nhttps://t.me/addstickers/{name}"),
+                )
+                .await
+            }
+            "history" | "archive" => match args.get(1).map(|value| value.to_ascii_lowercase()) {
+                Some(value) if matches!(value.as_str(), "on" | "off" | "true" | "false") => {
+                    if args.len() != 2 {
+                        bail!("用法：.q config history on|off");
+                    }
+                    let enabled = parse_history_enabled(&value)?;
+                    self.store
+                        .set_setting(
+                            HISTORY_ENABLED_SETTING,
+                            if enabled { "true" } else { "false" },
+                        )
+                        .await?;
+                    replace_with_chunks(
+                        &context.client,
+                        &context.message,
+                        if enabled {
+                            "✅ Q 历史存档已开启；从下一张新生成的语录开始保存"
+                        } else {
+                            "✅ Q 历史存档已关闭；已有存档仍可取回"
+                        },
+                    )
+                    .await
+                }
+                Some(value) if value == "limit" => {
+                    if args.len() != 3 {
+                        bail!("用法：.q config history limit <1-500>");
+                    }
+                    let limit = args[2].parse::<usize>().context("语录存档数量必须是数字")?;
+                    if !(1..=500).contains(&limit) {
+                        bail!("语录存档数量必须在 1 到 500 之间");
+                    }
+                    self.store
+                        .set_setting(HISTORY_LIMIT_SETTING, &limit.to_string())
+                        .await?;
+                    replace_with_chunks(
+                        &context.client,
+                        &context.message,
+                        &format!("✅ Q 历史存档上限已设置为 {limit} 条"),
+                    )
+                    .await
+                }
+                _ => bail!("用法：.q config history on|off，或 .q config history limit <1-500>"),
+            },
+            _ => bail!("未知配置项；可用：sticker、history"),
         }
-        let name = args[1..].join("_");
-        validate_sticker_set_name(&name)?;
-        self.store.set_setting(STICKER_SET_SETTING, &name).await?;
-        replace_with_chunks(
-            &context.client,
-            &context.message,
-            &format!("✅ 贴纸包已设置为 {name}\nhttps://t.me/addstickers/{name}"),
-        )
-        .await
     }
 }
 
@@ -514,6 +722,12 @@ impl Plugin for QuotePlugin {
         }
         if args
             .first()
+            .is_some_and(|arg| matches!(arg.to_ascii_lowercase().as_str(), "history" | "his"))
+        {
+            return self.history_command(&context, &args[1..]).await;
+        }
+        if args
+            .first()
             .is_some_and(|arg| arg.eq_ignore_ascii_case("s"))
         {
             return self.save_to_sticker_set(&context).await;
@@ -525,7 +739,7 @@ impl Plugin for QuotePlugin {
             return replace_with_markdown(
                 &context.client,
                 &context.message,
-                "# 🖼️ 语录\n\n- `.q [1-5]` — 从回复消息开始生成 WebP 贴纸\n- `.q r [1-5]` — 同时显示消息中的回复引用\n- `.q image [1-5]` — 生成 PNG 图片\n- `.q stories [1-5]` — 生成故事比例 PNG\n- `.q r image [1-5]` — 图片中同时显示回复引用\n- `.q s` — 把回复的贴纸或图片保存到贴纸包\n- `.q config` — 查看配置\n\n> 支持 Telegram 的“选择部分文字后回复”。",
+                "# 🖼️ 语录\n\n- `.q [1-5]` — 从回复消息开始生成 WebP 贴纸\n- `.q r [1-5]` — 同时显示消息中的回复引用\n- `.q image [1-5]` — 生成 PNG 图片\n- `.q stories [1-5]` — 生成故事比例 PNG\n- `.q r image [1-5]` — 图片中同时显示回复引用\n- `.q history` — 查看最近存档\n- `.q history <ID>` — 重新发送一条存档\n- `.q s` — 把回复的贴纸或图片保存到贴纸包\n- `.q config` — 查看配置\n\n> 支持 Telegram 的“选择部分文字后回复”。新存档从功能启用后开始，不补录旧 Q。",
             )
             .await;
         }
@@ -562,6 +776,47 @@ impl Plugin for QuotePlugin {
         }
         self.generate_quote(&context, include_replies, output, count)
             .await
+    }
+}
+
+fn parse_history_enabled(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => bail!("存档开关必须是 on 或 off"),
+    }
+}
+
+fn quote_preview_line(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        "[媒体]".to_owned()
+    } else {
+        text
+    }
+}
+
+fn quote_history_preview(lines: &[String]) -> String {
+    let source = lines.join(" / ");
+    let mut preview = source
+        .chars()
+        .take(MAX_HISTORY_PREVIEW_CHARS)
+        .collect::<String>();
+    if source.chars().count() > MAX_HISTORY_PREVIEW_CHARS {
+        preview.push('…');
+    }
+    preview
+}
+
+fn format_byte_size(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = 1024 * KIB;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -767,7 +1022,7 @@ async fn send_sticker_bytes(
     client: &Client,
     command: &Message,
     bytes: &[u8],
-    reply_to: i32,
+    reply_to: Option<i32>,
 ) -> Result<()> {
     let peer = require_peer_ref(command).await?;
     let webm = is_webm(bytes);
@@ -831,10 +1086,7 @@ async fn send_sticker_bytes(
         ttl_seconds: None,
     };
     client
-        .send_message(
-            peer,
-            InputMessage::new().media(media).reply_to(Some(reply_to)),
-        )
+        .send_message(peer, InputMessage::new().media(media).reply_to(reply_to))
         .await?;
     Ok(())
 }
@@ -843,7 +1095,7 @@ async fn send_photo_bytes(
     client: &Client,
     command: &Message,
     bytes: &[u8],
-    reply_to: i32,
+    reply_to: Option<i32>,
 ) -> Result<()> {
     if !is_png(bytes) {
         bail!("quote renderer did not return a PNG image");
@@ -862,10 +1114,7 @@ async fn send_photo_bytes(
         video: None,
     };
     client
-        .send_message(
-            peer,
-            InputMessage::new().media(media).reply_to(Some(reply_to)),
-        )
+        .send_message(peer, InputMessage::new().media(media).reply_to(reply_to))
         .await?;
     Ok(())
 }
@@ -1091,5 +1340,29 @@ mod tests {
             quote_endpoint("http://127.0.0.1:3210/generate", QuoteOutput::Stories),
             "http://127.0.0.1:3210/generate.png"
         );
+    }
+
+    #[test]
+    fn quote_history_preview_is_single_line_and_bounded() {
+        let long = "一".repeat(MAX_HISTORY_PREVIEW_CHARS + 20);
+        let preview = quote_history_preview(&[format!("名字：{long}\n第二行")]);
+        assert!(!preview.contains('\n'));
+        assert!(preview.chars().count() <= MAX_HISTORY_PREVIEW_CHARS + 1);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn quote_history_output_round_trips() {
+        for output in [
+            QuoteOutput::Sticker,
+            QuoteOutput::Image,
+            QuoteOutput::Stories,
+        ] {
+            assert_eq!(
+                QuoteOutput::from_history_kind(output.history_kind()).unwrap(),
+                output
+            );
+        }
+        assert!(QuoteOutput::from_history_kind("unknown").is_err());
     }
 }

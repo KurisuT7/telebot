@@ -1,0 +1,38 @@
+[telegram]
+api_id = 0
+api_hash_env = "TELEBOT_TELEGRAM_API_HASH"
+session_path = "/var/lib/telebot/telegram.session"
+command_prefixes = [".", "。", ",", "，", "$", "!", "！"]
+catch_up = true
+max_parallel_commands = 8
+
+[storage]
+path = "/var/lib/telebot/telebot.db"
+
+[ai]
+enabled = true
+provider = "gemini"
+api_key_env = "TELEBOT_GEMINI_API_KEY"
+base_url = "https://generativelanguage.googleapis.com"
+model = "gemini-3.5-flash"
+search_fallback_model = "gemini-3.1-flash-lite"
+thinking_level = "minimal"
+default_search = true
+system_prompt = "请使用中文准确、简洁地回答。使用联网搜索时优先采用可靠来源，并明确区分事实与推断。"
+# 兼容旧配置；当前版本始终默认无记忆，只读取明确回复的消息。
+history_turns = 0
+collapse_long_messages = true
+collapse_threshold_chars = 400
+max_output_tokens = 4096
+max_concurrent = 3
+search_timeout_seconds = 20
+search_hedge_seconds = 10
+fallback_timeout_seconds = 10
+
+[quote]
+enabled = true
+api_url = "http://127.0.0.1:3210/generate"
+timeout_seconds = 20
+max_messages = 5
+background_color = "#1b1429"
+sticker_set_short_name = ""

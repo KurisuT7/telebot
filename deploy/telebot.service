@@ -1,0 +1,35 @@
+[Unit]
+Description=telebot Telegram user client
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=telebot
+Group=telebot
+WorkingDirectory=/var/lib/telebot
+EnvironmentFile=/etc/telebot/telebot.env
+ExecStart=/opt/telebot/current/telebot serve --config /etc/telebot/config.toml
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillSignal=SIGINT
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/telebot
+
+[Install]
+WantedBy=multi-user.target

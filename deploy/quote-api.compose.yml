@@ -1,0 +1,27 @@
+services:
+  quote-api:
+    image: telebot-quote-api:6f91434c8d22
+    container_name: telebot-quote-api
+    init: true
+    restart: unless-stopped
+    pull_policy: never
+    ports:
+      - "127.0.0.1:3210:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    cpus: 1.5
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

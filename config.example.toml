@@ -14,9 +14,9 @@ enabled = true
 provider = "gemini"
 api_key_env = "TELEBOT_GEMINI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com"
-model = "gemini-3.5-flash"
+model = "gemini-3.6-flash"
 search_fallback_model = "gemini-3.1-flash-lite"
-thinking_level = "minimal"
+thinking_level = "low"
 default_search = true
 system_prompt = "请使用中文准确、简洁地回答。使用联网搜索时优先采用可靠来源，并明确区分事实与推断。"
 # 每个聊天的滚动上下文轮数；0 为关闭，运行时可用 .ai context 修改。

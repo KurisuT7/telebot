@@ -22,6 +22,7 @@ system_prompt = "请使用中文准确、简洁地回答。使用联网搜索时
 # 每个聊天的滚动上下文轮数；0 为关闭，运行时可用 .ai context 修改。
 history_turns = 0
 collapse_long_messages = true
+# 兼容旧配置；Q/A 现由上面的统一开关控制，不再按长度分别判断。
 collapse_threshold_chars = 400
 max_output_tokens = 4096
 max_concurrent = 3

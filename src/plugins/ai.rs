@@ -267,11 +267,7 @@ impl AiPlugin {
             &question,
             &answer,
             &runtime.provider_name,
-            if self.config.collapse_long_messages {
-                self.config.collapse_threshold_chars
-            } else {
-                usize::MAX
-            },
+            self.config.collapse_long_messages,
         );
         replace_with_rich_chunks(&context.client, &context.message, &rich).await?;
         if runtime.context_turns > 0
@@ -350,7 +346,7 @@ impl AiPlugin {
             format!("开启（{} 轮）", runtime.context_turns)
         };
         format!(
-            "🤖 **telebot AI**\n\n- 服务商：`{}`（Gemini 兼容）\n- BaseURL：`{}`\n- Key：**{}**\n- 主模型：`{}`\n- 原生搜索备用模型：`{}`\n- 原生搜索：`Google Search / Interactions API`\n- 思考等级：`{}`\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**{}**\n- 回复消息：作为本次请求上下文\n- 长文折叠：{}（{} 字起）\n- 原生搜索总时限：{} 秒\n- 慢请求切备用模型：{} 秒\n- 无搜索兜底时限：{} 秒\n- 并发上限：{}",
+            "🤖 **telebot AI**\n\n- 服务商：`{}`（Gemini 兼容）\n- BaseURL：`{}`\n- Key：**{}**\n- 主模型：`{}`\n- 原生搜索备用模型：`{}`\n- 原生搜索：`Google Search / Interactions API`\n- 思考等级：`{}`\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**{}**\n- 回复消息：作为本次请求上下文\n- Q/A 引用折叠：{}\n- 原生搜索总时限：{} 秒\n- 慢请求切备用模型：{} 秒\n- 无搜索兜底时限：{} 秒\n- 并发上限：{}",
             runtime.provider_name,
             runtime.base_url,
             if runtime.key_overridden {
@@ -372,7 +368,6 @@ impl AiPlugin {
             } else {
                 "关闭"
             },
-            self.config.collapse_threshold_chars,
             self.config.search_timeout_seconds,
             self.config.search_hedge_seconds,
             self.config.fallback_timeout_seconds,

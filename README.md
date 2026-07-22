@@ -29,8 +29,9 @@ authorized account, or its peer is Saved Messages. Incoming commands from other 
 Production enables update catch-up so commands written during a short restart are not lost.
 
 AI answers use native Telegram rich-text entities. Markdown headings, emphasis, code, lists and
-links are preserved; long answers are placed in an expandable block quote and oversized answers
-are split without breaking UTF-16 entity offsets. Provider, model and context settings are stored
+links are preserved; both the `Q:` and `A:` bodies use expandable block quotes by default, and
+oversized answers are split without breaking UTF-16 entity offsets. Provider, model and context
+settings are stored
 in the local application database. `.ai config key` is accepted only in Saved Messages, immediately
 redacts the command, never echoes the value, and stores it in the owner-protected local database;
 otherwise the key continues to come from the server environment.

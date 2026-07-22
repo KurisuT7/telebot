@@ -395,7 +395,7 @@ pub fn ai_rich_response(
     question: &str,
     answer_markdown: &str,
     provider: &str,
-    collapse_threshold: usize,
+    collapsed: bool,
 ) -> RichText {
     let mut rich = RichText::default();
     let q_label = rich.offset();
@@ -404,16 +404,7 @@ pub fn ai_rich_response(
     rich.push("\n");
     let q_start = rich.offset();
     rich.push(question.trim());
-    let question_length = rich.offset().saturating_sub(q_start);
-    if question_length >= collapse_threshold {
-        rich.entities.push(RichEntity {
-            offset: q_start,
-            length: question_length,
-            kind: RichEntityKind::Blockquote { collapsed: true },
-        });
-    } else {
-        rich.push_entity(q_start, RichEntityKind::Blockquote { collapsed: false });
-    }
+    rich.push_entity(q_start, RichEntityKind::Blockquote { collapsed });
 
     rich.push("\n\n");
     let a_label = rich.offset();
@@ -423,13 +414,11 @@ pub fn ai_rich_response(
     let answer_start = rich.offset();
     rich.append(telegram_markdown(answer_markdown));
     let answer_length = rich.offset().saturating_sub(answer_start);
-    if answer_length >= collapse_threshold {
-        rich.entities.push(RichEntity {
-            offset: answer_start,
-            length: answer_length,
-            kind: RichEntityKind::Blockquote { collapsed: true },
-        });
-    }
+    rich.entities.push(RichEntity {
+        offset: answer_start,
+        length: answer_length,
+        kind: RichEntityKind::Blockquote { collapsed },
+    });
 
     rich.push("\n\n");
     let footer_start = rich.offset();
@@ -680,33 +669,33 @@ mod tests {
     }
 
     #[test]
-    fn long_ai_answer_uses_expandable_blockquote() {
-        let rich = ai_rich_response("问题", &"很长".repeat(500), "Gemini", 600);
+    fn ai_question_and_answer_use_expandable_blockquotes_by_default() {
+        let rich = ai_rich_response("短问题", "短回答", "Gemini", true);
         assert!(rich.text.ends_with("🍀 Powered by Gemini"));
         assert!(!rich.text.contains("联网搜索"));
         assert!(!rich.text.contains("普通回答"));
-        assert!(
-            rich.entities.iter().any(|entity| matches!(
-                entity.kind,
-                RichEntityKind::Blockquote { collapsed: true }
-            ))
-        );
-    }
-
-    #[test]
-    fn long_ai_question_uses_expandable_blockquote() {
-        let rich = ai_rich_response(&"question ".repeat(100), "short answer", "Gemini", 600);
         let collapsed = rich
             .entities
             .iter()
             .filter(|entity| matches!(entity.kind, RichEntityKind::Blockquote { collapsed: true }))
             .count();
-        assert_eq!(collapsed, 1);
+        assert_eq!(collapsed, 2);
+    }
+
+    #[test]
+    fn ai_question_and_answer_stay_quoted_when_collapsing_is_disabled() {
+        let rich = ai_rich_response("短问题", "短回答", "Gemini", false);
+        let expanded = rich
+            .entities
+            .iter()
+            .filter(|entity| matches!(entity.kind, RichEntityKind::Blockquote { collapsed: false }))
+            .count();
+        assert_eq!(expanded, 2);
     }
 
     #[test]
     fn rich_chunks_clip_entities_to_utf16_boundaries() {
-        let rich = ai_rich_response("问题", &"😀内容".repeat(2000), "Gemini", 100);
+        let rich = ai_rich_response("问题", &"😀内容".repeat(2000), "Gemini", true);
         let ranges = split_telegram_ranges(&rich.text, 500);
         assert!(ranges.len() > 1);
         for range in ranges {

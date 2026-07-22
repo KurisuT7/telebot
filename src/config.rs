@@ -57,8 +57,11 @@ pub struct AiConfig {
     pub history_turns: usize,
     #[serde(default = "default_true")]
     pub collapse_long_messages: bool,
-    #[serde(default = "default_collapse_threshold")]
-    pub collapse_threshold_chars: usize,
+    #[serde(
+        default = "default_collapse_threshold",
+        rename = "collapse_threshold_chars"
+    )]
+    pub _collapse_threshold_chars: usize,
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
     #[serde(default = "default_ai_concurrency")]
@@ -150,9 +153,6 @@ impl Config {
             }
             if self.ai.history_turns > 20 {
                 bail!("ai.history_turns must be between 0 and 20");
-            }
-            if !(200..=3500).contains(&self.ai.collapse_threshold_chars) {
-                bail!("ai.collapse_threshold_chars must be between 200 and 3500");
             }
             if !(1..=65_536).contains(&self.ai.max_output_tokens) {
                 bail!("ai.max_output_tokens must be between 1 and 65536");

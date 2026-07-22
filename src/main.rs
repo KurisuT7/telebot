@@ -284,7 +284,7 @@ async fn check_telegram_format(config_path: &Path) -> Result<()> {
             "## 富文本检查\n\n- **粗体**、*斜体*、`代码`\n- [链接](https://example.com)\n\n"
                 .to_owned()
                 + &"这是一段用于确认 Telegram 可展开引用实体的文字。".repeat(20);
-        let rich = telegram::ai_rich_response("一次性服务器验收", &answer, "telebot", 200);
+        let rich = telegram::ai_rich_response("一次性服务器验收", &answer, "telebot", true);
         let message = client.send_message(peer, rich.input_message()).await?;
         let expandable = message.fmt_entities().is_some_and(|entities| {
             entities.iter().any(|entity| {

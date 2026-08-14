@@ -11,6 +11,8 @@ pub struct Config {
     pub telegram: TelegramConfig,
     pub storage: StorageConfig,
     pub ai: AiConfig,
+    #[serde(default)]
+    pub messages: MessagesConfig,
     pub quote: QuoteConfig,
 }
 
@@ -68,10 +70,28 @@ pub struct AiConfig {
     pub max_concurrent: usize,
     #[serde(default = "default_search_timeout")]
     pub search_timeout_seconds: u64,
+    #[serde(default = "default_image_search_timeout")]
+    pub image_search_timeout_seconds: u64,
     #[serde(default = "default_search_hedge")]
     pub search_hedge_seconds: u64,
     #[serde(default = "default_fallback_timeout")]
     pub fallback_timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessagesConfig {
+    pub ai_searching: String,
+    pub ai_thinking: String,
+}
+
+impl Default for MessagesConfig {
+    fn default() -> Self {
+        Self {
+            ai_searching: "🔎 正在搜索…".to_owned(),
+            ai_thinking: "💭 正在思考…".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -158,14 +178,20 @@ impl Config {
                 bail!("ai.max_output_tokens must be between 1 and 65536");
             }
             if !(3..=120).contains(&self.ai.search_timeout_seconds)
+                || !(3..=120).contains(&self.ai.image_search_timeout_seconds)
                 || !(3..=120).contains(&self.ai.fallback_timeout_seconds)
             {
                 bail!("AI timeouts must be between 3 and 120 seconds");
+            }
+            if self.ai.image_search_timeout_seconds < self.ai.search_timeout_seconds {
+                bail!("ai.image_search_timeout_seconds must be at least search timeout");
             }
             if !(3..self.ai.search_timeout_seconds).contains(&self.ai.search_hedge_seconds) {
                 bail!("ai.search_hedge_seconds must be at least 3 and below search timeout");
             }
         }
+        validate_progress_message("messages.ai_searching", &self.messages.ai_searching)?;
+        validate_progress_message("messages.ai_thinking", &self.messages.ai_thinking)?;
         if self.quote.enabled {
             if !(1..=10).contains(&self.quote.max_messages) {
                 bail!("quote.max_messages must be between 1 and 10");
@@ -256,6 +282,17 @@ fn default_ai_concurrency() -> usize {
 fn default_search_timeout() -> u64 {
     20
 }
+
+fn validate_progress_message(name: &str, value: &str) -> Result<()> {
+    let length = value.chars().count();
+    if value.trim().is_empty() || length > 128 || value.contains('\r') || value.contains('\n') {
+        bail!("{name} must be a non-empty single line of at most 128 characters");
+    }
+    Ok(())
+}
+fn default_image_search_timeout() -> u64 {
+    30
+}
 fn default_search_hedge() -> u64 {
     10
 }
@@ -291,5 +328,21 @@ mod tests {
         for expected in [".", "。", ",", "，"] {
             assert!(prefixes.iter().any(|prefix| prefix == expected));
         }
+    }
+
+    #[test]
+    fn image_search_default_is_longer_than_text_search() {
+        assert!(default_image_search_timeout() > default_search_timeout());
+    }
+
+    #[test]
+    fn message_defaults_are_available_without_a_toml_section() {
+        let raw = include_str!("../config.example.toml").replace(
+            "\n[messages]\nai_searching = \"🔎 正在搜索…\"\nai_thinking = \"💭 正在思考…\"\n",
+            "\n",
+        );
+        let parsed: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.messages.ai_searching, "🔎 正在搜索…");
+        assert_eq!(parsed.messages.ai_thinking, "💭 正在思考…");
     }
 }

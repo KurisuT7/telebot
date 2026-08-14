@@ -24,7 +24,7 @@ use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
 use grammers_session::updates::UpdatesLike;
 use grammers_tl_types as tl;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -32,10 +32,12 @@ use tracing_subscriber::EnvFilter;
 use crate::command::{Command, parse};
 use crate::config::Config;
 use crate::plugin::{CommandContext, Plugin, Router};
-use crate::plugins::ai::AiPlugin;
+use crate::plugins::ai::{AiPlugin, AiProgressConfig};
 use crate::plugins::quote::QuotePlugin;
 use crate::store::Store;
 use crate::telegram::replace_with_chunks;
+
+const MAX_TELEGRAM_SMOKE_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct RawCommandCandidate {
@@ -82,6 +84,12 @@ enum Commands {
         #[arg(long, default_value = "/etc/telebot/config.toml")]
         config: PathBuf,
     },
+    CheckTelegramImage {
+        #[arg(long, default_value = "/etc/telebot/config.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        image: PathBuf,
+    },
     ImportGramjsSession {
         #[arg(long)]
         from: PathBuf,
@@ -125,10 +133,107 @@ async fn main() -> Result<()> {
         }
         Commands::CheckTelegramFormat { config } => check_telegram_format(&config).await,
         Commands::CheckTelegramPlugins { config } => check_telegram_plugins(&config).await,
+        Commands::CheckTelegramImage { config, image } => {
+            check_telegram_image(&config, &image).await
+        }
         Commands::ImportGramjsSession { from, to } => {
             session_import::import_gramjs_config(&from, &to).await
         }
     }
+}
+
+async fn check_telegram_image(config_path: &Path, image_path: &Path) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let secrets = config.load_secrets()?;
+    let _telegram_api_hash = &secrets.telegram_api_hash;
+    let metadata = tokio::fs::metadata(image_path)
+        .await
+        .with_context(|| format!("failed to inspect {}", image_path.display()))?;
+    if metadata.len() == 0 || metadata.len() > MAX_TELEGRAM_SMOKE_IMAGE_BYTES {
+        bail!("Telegram image smoke input must be between 1 byte and 8 MB");
+    }
+
+    let temporary = tempfile::tempdir()?;
+    let store = Arc::new(Store::open(&temporary.path().join("check.db")).await?);
+    let session = Arc::new(SqliteSession::open(&config.telegram.session_path).await?);
+    let SenderPool { runner, handle, .. } =
+        SenderPool::new(Arc::clone(&session), config.telegram.api_id);
+    let client = Client::new(handle.clone());
+    let pool_task = tokio::spawn(runner.run());
+    let result = async {
+        if !client.is_authorized().await? {
+            bail!("Telegram session is not authorized");
+        }
+        let me = client.get_me().await?;
+        let peer = me
+            .to_ref()
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .context("Telegram self peer is unavailable")?;
+
+        let uploaded = client.upload_file(image_path).await?;
+        let image_source = client
+            .send_message(peer, InputMessage::new().photo(uploaded))
+            .await?;
+        let ai_command = client
+            .send_message(
+                peer,
+                InputMessage::new()
+                    .text(".telebot_image_smoke")
+                    .reply_to(Some(image_source.id())),
+            )
+            .await?;
+        let progress = Arc::new(RwLock::new(AiProgressConfig::new(
+            &config.ai,
+            &config.messages,
+        )));
+        let ai = AiPlugin::new(
+            config_path.to_path_buf(),
+            config.ai.clone(),
+            config.messages.clone(),
+            secrets.ai_api_key.context("AI key is missing")?,
+            Arc::clone(&store),
+            Arc::clone(&progress),
+        )
+        .await?;
+        let ai_result = ai
+            .handle(CommandContext {
+                client: client.clone(),
+                message: ai_command.clone(),
+                command: Command {
+                    prefix: ".".to_owned(),
+                    name: "ai".to_owned(),
+                    raw_args: "search".to_owned(),
+                    args: vec!["search".to_owned()],
+                },
+            })
+            .await;
+        let refreshed_ai = client
+            .get_messages_by_id(peer, &[ai_command.id()])
+            .await?
+            .pop()
+            .flatten();
+        let ai_valid = refreshed_ai.as_ref().is_some_and(|message| {
+            message.text().contains("A:") && message.text().ends_with("🍀 Powered by Gemini")
+        });
+        if let Some(message) = refreshed_ai {
+            let _ = message.delete().await;
+        } else {
+            let _ = ai_command.delete().await;
+        }
+        let _ = image_source.delete().await;
+        ai_result?;
+        if !ai_valid {
+            bail!("AI image smoke test did not produce a Gemini answer");
+        }
+
+        println!("Telegram AI image check passed; temporary items deleted");
+        Ok(())
+    }
+    .await;
+    handle.quit();
+    let _ = pool_task.await;
+    result
 }
 
 async fn check_telegram_plugins(config_path: &Path) -> Result<()> {
@@ -164,10 +269,17 @@ async fn check_telegram_plugins(config_path: &Path) -> Result<()> {
                     .reply_to(Some(ai_source.id())),
             )
             .await?;
+        let progress = Arc::new(RwLock::new(AiProgressConfig::new(
+            &config.ai,
+            &config.messages,
+        )));
         let ai = AiPlugin::new(
+            config_path.to_path_buf(),
             config.ai.clone(),
+            config.messages.clone(),
             secrets.ai_api_key.context("AI key is missing")?,
             Arc::clone(&store),
+            Arc::clone(&progress),
         )
         .await?;
         let ai_result = ai
@@ -202,6 +314,78 @@ async fn check_telegram_plugins(config_path: &Path) -> Result<()> {
         ai_result?;
         if !ai_valid {
             bail!("AI reply smoke test did not use the replied message");
+        }
+
+        let help_command = client.send_message(peer, ".telebot_help_smoke").await?;
+        let help_result = ai
+            .handle(CommandContext {
+                client: client.clone(),
+                message: help_command.clone(),
+                command: Command {
+                    prefix: ".".to_owned(),
+                    name: "ai".to_owned(),
+                    raw_args: "help".to_owned(),
+                    args: vec!["help".to_owned()],
+                },
+            })
+            .await;
+        let refreshed_help = client
+            .get_messages_by_id(peer, &[help_command.id()])
+            .await?
+            .pop()
+            .flatten();
+        let help_valid = refreshed_help.as_ref().is_some_and(|message| {
+            message.text().contains("TeleBot AI 帮助")
+                && message.text().contains("回复消息与图片")
+                && message.text().contains("动态配置（仅限收藏夹）")
+                && message.text().contains("config reload")
+        });
+        if let Some(message) = refreshed_help {
+            let _ = message.delete().await;
+        } else {
+            let _ = help_command.delete().await;
+        }
+        help_result?;
+        if !help_valid {
+            bail!("AI help smoke test did not contain the detailed guide");
+        }
+
+        let config_command = client.send_message(peer, ".telebot_config_smoke").await?;
+        let config_result = ai
+            .handle(CommandContext {
+                client: client.clone(),
+                message: config_command.clone(),
+                command: Command {
+                    prefix: ".".to_owned(),
+                    name: "ai".to_owned(),
+                    raw_args: "config message searching 🔍 配置化搜索测试".to_owned(),
+                    args: vec![
+                        "config".to_owned(),
+                        "message".to_owned(),
+                        "searching".to_owned(),
+                        "🔍".to_owned(),
+                        "配置化搜索测试".to_owned(),
+                    ],
+                },
+            })
+            .await;
+        let refreshed_config = client
+            .get_messages_by_id(peer, &[config_command.id()])
+            .await?
+            .pop()
+            .flatten();
+        let config_valid = refreshed_config
+            .as_ref()
+            .is_some_and(|message| message.text().contains("进度文案已更新"))
+            && progress.read().await.searching == "🔍 配置化搜索测试";
+        if let Some(message) = refreshed_config {
+            let _ = message.delete().await;
+        } else {
+            let _ = config_command.delete().await;
+        }
+        config_result?;
+        if !config_valid {
+            bail!("AI dynamic message smoke test did not update the live progress configuration");
         }
 
         let quote_source = client
@@ -251,7 +435,7 @@ async fn check_telegram_plugins(config_path: &Path) -> Result<()> {
         }
 
         println!(
-            "Telegram plugin checks passed: .ai reply context and .q sticker; temporary items deleted"
+            "Telegram plugin checks passed: .ai reply, detailed help, dynamic message config and .q sticker; temporary items deleted"
         );
         Ok(())
     }
@@ -463,13 +647,13 @@ fn raw_command_candidates(
     }
 }
 
-fn command_progress_text(command: &Command, default_search: bool) -> Option<&'static str> {
+fn command_progress_text(command: &Command, progress: &AiProgressConfig) -> Option<String> {
     let mut parts = command.raw_args.split_whitespace();
     let first = parts.next().unwrap_or("").to_ascii_lowercase();
     let second = parts.next().unwrap_or("").to_ascii_lowercase();
     match command.name.as_str() {
         "ai" if matches!(first.as_str(), "config" | "cfg") && second == "key" => {
-            Some("🔐 正在安全更新 AI 配置…")
+            Some("🔐 正在安全更新 AI 配置…".to_owned())
         }
         "ai" if matches!(
             first.as_str(),
@@ -478,14 +662,16 @@ fn command_progress_text(command: &Command, default_search: bool) -> Option<&'st
         {
             None
         }
-        "ai" if matches!(first.as_str(), "chat" | "c") => Some("💭 正在思考…"),
-        "ai" if matches!(first.as_str(), "search" | "s") => Some("🔎 正在联网搜索…"),
-        "ai" if default_search => Some("🔎 正在联网搜索…"),
-        "ai" => Some("💭 正在思考…"),
+        "ai" if matches!(first.as_str(), "chat" | "c") => Some(progress.thinking.clone()),
+        "ai" if matches!(first.as_str(), "search" | "s") => Some(progress.searching.clone()),
+        "ai" if progress.default_search => Some(progress.searching.clone()),
+        "ai" => Some(progress.thinking.clone()),
         "q" if matches!(first.as_str(), "config" | "help" | "h") => None,
-        "q" if matches!(first.as_str(), "history" | "his") => Some("🗂️ 正在读取语录存档…"),
-        "q" if first == "s" => Some("📦 正在保存到贴纸包…"),
-        "q" => Some("🖼️ 正在生成语录贴纸…"),
+        "q" if matches!(first.as_str(), "history" | "his") => {
+            Some("🗂️ 正在读取语录存档…".to_owned())
+        }
+        "q" if first == "s" => Some("📦 正在保存到贴纸包…".to_owned()),
+        "q" => Some("🖼️ 正在生成语录贴纸…".to_owned()),
         _ => None,
     }
 }
@@ -502,7 +688,7 @@ async fn execute_fast_command(
     plugin: Arc<dyn Plugin>,
     capacity: Arc<Semaphore>,
     candidate: RawCommandCandidate,
-    progress: Option<&'static str>,
+    progress: Option<String>,
 ) {
     let started = Instant::now();
     let peer = match session.peer_ref(candidate.peer_id).await {
@@ -624,13 +810,20 @@ async fn serve(config_path: &Path) -> Result<()> {
         Err(_) => warn!("Telegram peer cache warmup exceeded 30 seconds; continuing"),
     }
 
+    let ai_progress = Arc::new(RwLock::new(AiProgressConfig::new(
+        &config.ai,
+        &config.messages,
+    )));
     let mut router = Router::default();
     if config.ai.enabled {
         router.register(Arc::new(
             AiPlugin::new(
+                config_path.to_path_buf(),
                 config.ai.clone(),
+                config.messages.clone(),
                 secrets.ai_api_key.expect("AI key checked by config"),
                 Arc::clone(&store),
+                Arc::clone(&ai_progress),
             )
             .await?,
         ))?;
@@ -707,7 +900,8 @@ async fn serve(config_path: &Path) -> Result<()> {
                     raw_age_ms,
                     "raw Telegram command received"
                 );
-                let progress = command_progress_text(&candidate.command, config.ai.default_search);
+                let progress_config = ai_progress.read().await.clone();
+                let progress = command_progress_text(&candidate.command, &progress_config);
                 tasks.spawn(execute_fast_command(
                     Arc::clone(&session),
                     client.clone(),
@@ -805,8 +999,8 @@ fn user_facing_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, PeerId, UpdatesLike, command_belongs_to_self, command_progress_text,
-        raw_command_candidates, tl,
+        AiProgressConfig, Command, PeerId, UpdatesLike, command_belongs_to_self,
+        command_progress_text, raw_command_candidates, tl,
     };
 
     fn short_message(out: bool, user_id: i64, text: &str) -> UpdatesLike {
@@ -857,6 +1051,11 @@ mod tests {
 
     #[test]
     fn fast_progress_redacts_keys_and_labels_history() {
+        let searching = AiProgressConfig {
+            default_search: true,
+            searching: "🔎 自定义搜索进度".to_owned(),
+            thinking: "💭 自定义思考进度".to_owned(),
+        };
         let key_command = Command {
             prefix: ".".to_owned(),
             name: "ai".to_owned(),
@@ -868,8 +1067,8 @@ mod tests {
             ],
         };
         assert_eq!(
-            command_progress_text(&key_command, true),
-            Some("🔐 正在安全更新 AI 配置…")
+            command_progress_text(&key_command, &searching),
+            Some("🔐 正在安全更新 AI 配置…".to_owned())
         );
 
         let context_command = Command {
@@ -878,7 +1077,18 @@ mod tests {
             raw_args: "context 6".to_owned(),
             args: vec!["context".to_owned(), "6".to_owned()],
         };
-        assert_eq!(command_progress_text(&context_command, true), None);
+        assert_eq!(command_progress_text(&context_command, &searching), None);
+
+        let search_command = Command {
+            prefix: ".".to_owned(),
+            name: "ai".to_owned(),
+            raw_args: "search rust".to_owned(),
+            args: vec!["search".to_owned(), "rust".to_owned()],
+        };
+        assert_eq!(
+            command_progress_text(&search_command, &searching),
+            Some("🔎 自定义搜索进度".to_owned())
+        );
 
         let history_command = Command {
             prefix: ".".to_owned(),
@@ -887,8 +1097,8 @@ mod tests {
             args: vec!["history".to_owned(), "1".to_owned()],
         };
         assert_eq!(
-            command_progress_text(&history_command, true),
-            Some("🗂️ 正在读取语录存档…")
+            command_progress_text(&history_command, &searching),
+            Some("🗂️ 正在读取语录存档…".to_owned())
         );
     }
 }

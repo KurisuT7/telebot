@@ -12,8 +12,10 @@ Initial commands:
 - `.ai config`: inspect the active Gemini-compatible provider without revealing its key.
 - `.ai config provider <name> <base_url>`: change the provider label and Gemini-compatible endpoint.
 - `.ai config key <key>` / `.ai config model <primary> [search_fallback]`: update credentials or models.
+- `.ai config prompt|thinking|search|timeout|tokens|collapse|message`: update common AI behavior and progress text immediately without rebuilding.
+- `.ai config reload`: reload the server AI/message TOML while keeping SQLite runtime overrides; `.ai config reset` clears those overrides.
 - `.ai context <0-20|on|off>`: configure per-chat rolling context; it remains off by default.
-- `.ai reset|status|help`: clear the current chat context, inspect configuration, or show help.
+- `.ai reset|status|help`: clear the current chat context, inspect configuration, or show the detailed usage and safety guide.
 - `.q [1-5]`: generate a quote sticker from the replied message and following messages.
 - `.q r [1-5]`, `.q image [1-5]`, `.q stories [1-5]`: include replies or choose PNG layouts.
 - `.q history` / `.q history <id>`: list recent archived quotes or resend one by ID.
@@ -39,7 +41,14 @@ otherwise the key continues to come from the server environment.
 Default web answers continue to use Gemini native Google Search through the Interactions API. The
 active provider can be replaced at runtime with a Gemini-compatible endpoint while keeping the same
 grounding path. Stable primary and fallback models are hedged, and Google citation annotations are
-deduplicated and rendered as Telegram links; no third-party search-result scraping is used.
+deduplicated and rendered as Telegram links. Image-grounded searches have a separate, longer total
+timeout so slow multimodal requests do not change the text-only latency budget; no third-party
+search-result scraping is used.
+
+Frequently adjusted AI values are runtime settings stored in SQLite. Provider, BaseURL, Key, models,
+system prompt, thinking level, default-search mode, timeouts, maximum output, quote collapsing and AI
+progress messages can be changed from Saved Messages and take effect immediately. The `[messages]`
+TOML section supplies server defaults. Concurrency and plugin enable/disable remain startup-only.
 
 ## Design
 
@@ -64,12 +73,14 @@ telebot import-gramjs-session --from /path/to/TeleBox/config.json --to /var/lib/
 telebot check-session --config /etc/telebot/config.toml
 telebot check-ai --config /etc/telebot/config.toml
 telebot check-quote --config /etc/telebot/config.toml
+telebot check-telegram-image --config /etc/telebot/config.toml --image /path/to/test-image.png
 telebot serve --config /etc/telebot/config.toml
 ```
 
 Commands that open the Telegram session must not run beside `telebot.service`. On a systemd host, use
-`scripts/server/check-telegram.sh session|format|plugins|all`; it stops the service, performs the
+`scripts/server/check-telegram.sh session|format|plugins|all` or
+`scripts/server/check-telegram.sh image /path/to/test-image.png`; it stops the service, performs the
 requested checks and verifies that the service becomes ready again.
 
-Builds use the pinned Rust 1.90 toolchain and a committed `Cargo.lock`. Deployment, health checks,
-rollback and upgrade notes are in `docs/operations.md`.
+Builds use the pinned Rust 1.90 toolchain, a committed `Cargo.lock` and a reusable container cache.
+Deployment, health checks, rollback and upgrade notes are in `docs/operations.md`.

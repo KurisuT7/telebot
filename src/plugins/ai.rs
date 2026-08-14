@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine;
 use grammers_client::Client;
-use grammers_client::media::Media;
+use grammers_client::media::{Media, Photo, PhotoSize};
 use grammers_client::message::Message;
 use reqwest::{StatusCode, Url};
 use serde_json::{Value, json};
@@ -15,7 +16,7 @@ use tokio::sync::{RwLock, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
-use crate::config::AiConfig;
+use crate::config::{AiConfig, Config, MessagesConfig};
 use crate::plugin::{CommandContext, Plugin};
 use crate::store::{AiHistoryEntry, Store};
 use crate::telegram::{
@@ -37,6 +38,34 @@ const AI_KEY_SETTING: &str = "ai.runtime.api_key";
 const AI_MODEL_SETTING: &str = "ai.runtime.model";
 const AI_SEARCH_MODEL_SETTING: &str = "ai.runtime.search_model";
 const AI_CONTEXT_SETTING: &str = "ai.runtime.context_turns";
+const AI_THINKING_SETTING: &str = "ai.runtime.thinking_level";
+const AI_DEFAULT_SEARCH_SETTING: &str = "ai.runtime.default_search";
+const AI_SYSTEM_PROMPT_SETTING: &str = "ai.runtime.system_prompt";
+const AI_MAX_OUTPUT_TOKENS_SETTING: &str = "ai.runtime.max_output_tokens";
+const AI_SEARCH_TIMEOUT_SETTING: &str = "ai.runtime.search_timeout_seconds";
+const AI_IMAGE_SEARCH_TIMEOUT_SETTING: &str = "ai.runtime.image_search_timeout_seconds";
+const AI_SEARCH_HEDGE_SETTING: &str = "ai.runtime.search_hedge_seconds";
+const AI_FALLBACK_TIMEOUT_SETTING: &str = "ai.runtime.fallback_timeout_seconds";
+const AI_COLLAPSE_SETTING: &str = "ai.runtime.collapse_long_messages";
+const AI_SEARCHING_MESSAGE_SETTING: &str = "ai.runtime.message.searching";
+const AI_THINKING_MESSAGE_SETTING: &str = "ai.runtime.message.thinking";
+
+#[derive(Clone, Debug)]
+pub struct AiProgressConfig {
+    pub default_search: bool,
+    pub searching: String,
+    pub thinking: String,
+}
+
+impl AiProgressConfig {
+    pub fn new(config: &AiConfig, messages: &MessagesConfig) -> Self {
+        Self {
+            default_search: config.default_search,
+            searching: messages.ai_searching.clone(),
+            thinking: messages.ai_thinking.clone(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct AiImage {
@@ -68,6 +97,8 @@ struct AiRuntimeOptions {
     search_fallback_model: String,
     context_turns: usize,
     key_overridden: bool,
+    config: AiConfig,
+    messages: MessagesConfig,
 }
 
 #[derive(Clone)]
@@ -79,6 +110,8 @@ struct AiRuntime {
     search_fallback_model: String,
     context_turns: usize,
     key_overridden: bool,
+    config: AiConfig,
+    messages: MessagesConfig,
     provider: GeminiProvider,
 }
 
@@ -92,12 +125,14 @@ impl From<&AiRuntime> for AiRuntimeOptions {
             search_fallback_model: runtime.search_fallback_model.clone(),
             context_turns: runtime.context_turns,
             key_overridden: runtime.key_overridden,
+            config: runtime.config.clone(),
+            messages: runtime.messages.clone(),
         }
     }
 }
 
 impl AiRuntime {
-    fn build(config: &AiConfig, options: AiRuntimeOptions) -> Result<Self> {
+    fn build(options: AiRuntimeOptions) -> Result<Self> {
         let AiRuntimeOptions {
             provider_name,
             base_url,
@@ -106,6 +141,8 @@ impl AiRuntime {
             search_fallback_model,
             context_turns,
             key_overridden,
+            config,
+            messages,
         } = options;
         validate_provider_name(&provider_name)?;
         let base_url = normalize_base_url(&base_url)?;
@@ -115,8 +152,9 @@ impl AiRuntime {
         if context_turns > 20 {
             bail!("上下文轮数必须在 0 到 20 之间");
         }
+        validate_runtime_config(&config, &messages)?;
         let provider = GeminiProvider::new_runtime(
-            config,
+            &config,
             &base_url,
             &primary_model,
             &search_fallback_model,
@@ -130,6 +168,8 @@ impl AiRuntime {
             search_fallback_model,
             context_turns,
             key_overridden,
+            config,
+            messages,
             provider,
         })
     }
@@ -172,57 +212,51 @@ pub async fn check_provider(config: &AiConfig, api_key: String) -> Result<()> {
 }
 
 pub struct AiPlugin {
-    config: AiConfig,
-    env_api_key: String,
+    config_path: PathBuf,
+    defaults: RwLock<AiDefaults>,
     runtime: RwLock<AiRuntime>,
+    progress: Arc<RwLock<AiProgressConfig>>,
     store: Arc<Store>,
     capacity: Arc<Semaphore>,
 }
 
+#[derive(Clone)]
+struct AiDefaults {
+    config: AiConfig,
+    messages: MessagesConfig,
+    env_api_key: String,
+}
+
 impl AiPlugin {
-    pub async fn new(config: AiConfig, env_api_key: String, store: Arc<Store>) -> Result<Self> {
-        let provider_name = store
-            .get_setting(AI_PROVIDER_SETTING)
-            .await?
-            .unwrap_or_else(|| default_provider_name(&config));
-        let base_url = store
-            .get_setting(AI_BASE_URL_SETTING)
-            .await?
-            .unwrap_or_else(|| config.base_url.clone());
-        let key_override = store.get_setting(AI_KEY_SETTING).await?;
-        let key_overridden = key_override.is_some();
-        let api_key = key_override.unwrap_or_else(|| env_api_key.clone());
-        let primary_model = store
-            .get_setting(AI_MODEL_SETTING)
-            .await?
-            .unwrap_or_else(|| config.model.clone());
-        let search_fallback_model = store
-            .get_setting(AI_SEARCH_MODEL_SETTING)
-            .await?
-            .unwrap_or_else(|| config.search_fallback_model.clone());
-        let context_turns = match store.get_setting(AI_CONTEXT_SETTING).await? {
-            Some(value) => parse_context_turns(&value)?,
-            None => config.history_turns,
-        };
-        let runtime = AiRuntime::build(
-            &config,
-            AiRuntimeOptions {
-                provider_name,
-                base_url,
-                api_key,
-                primary_model,
-                search_fallback_model,
-                context_turns,
-                key_overridden,
-            },
-        )?;
-        Ok(Self {
-            capacity: Arc::new(Semaphore::new(config.max_concurrent)),
+    pub async fn new(
+        config_path: PathBuf,
+        config: AiConfig,
+        messages: MessagesConfig,
+        env_api_key: String,
+        store: Arc<Store>,
+        progress: Arc<RwLock<AiProgressConfig>>,
+    ) -> Result<Self> {
+        let defaults = AiDefaults {
             config,
+            messages,
             env_api_key,
+        };
+        let runtime = runtime_from_store(&defaults, &store).await?;
+        *progress.write().await = progress_from_runtime(&runtime);
+        let max_concurrent = defaults.config.max_concurrent;
+        Ok(Self {
+            capacity: Arc::new(Semaphore::new(max_concurrent)),
+            config_path,
+            defaults: RwLock::new(defaults),
             runtime: RwLock::new(runtime),
+            progress,
             store,
         })
+    }
+
+    async fn install_runtime(&self, runtime: AiRuntime) {
+        *self.progress.write().await = progress_from_runtime(&runtime);
+        *self.runtime.write().await = runtime;
     }
 
     async fn answer(
@@ -247,7 +281,7 @@ impl AiPlugin {
         let prompt = compose_history_prompt(&history, &prompt);
         let started = Instant::now();
         let (answer, searched) = if use_search {
-            self.answer_with_native_search(&runtime.provider, &prompt, &images, &scope)
+            self.answer_with_native_search(&runtime, &prompt, &images, &scope)
                 .await?
         } else {
             (
@@ -256,7 +290,7 @@ impl AiPlugin {
                     .generate_chat_with_timeout(
                         &prompt,
                         &images,
-                        Duration::from_secs(self.config.fallback_timeout_seconds),
+                        Duration::from_secs(runtime.config.fallback_timeout_seconds),
                     )
                     .await?,
                 false,
@@ -267,7 +301,7 @@ impl AiPlugin {
             &question,
             &answer,
             &runtime.provider_name,
-            self.config.collapse_long_messages,
+            runtime.config.collapse_long_messages,
         );
         replace_with_rich_chunks(&context.client, &context.message, &rich).await?;
         if runtime.context_turns > 0
@@ -296,17 +330,19 @@ impl AiPlugin {
 
     async fn answer_with_native_search(
         &self,
-        provider: &GeminiProvider,
+        runtime: &AiRuntime,
         prompt: &str,
         images: &[AiImage],
         scope: &str,
     ) -> Result<(String, bool)> {
-        match provider
+        let search_timeout_seconds = effective_search_timeout_seconds(&runtime.config, images);
+        match runtime
+            .provider
             .generate_search_hedged(
                 prompt,
                 images,
-                Duration::from_secs(self.config.search_timeout_seconds),
-                Duration::from_secs(self.config.search_hedge_seconds),
+                Duration::from_secs(search_timeout_seconds),
+                Duration::from_secs(runtime.config.search_hedge_seconds),
             )
             .await
         {
@@ -323,11 +359,12 @@ impl AiPlugin {
             }
             Err(search_error) => {
                 warn!(error = %search_error, scope, "Gemini native search models failed; using non-search fallback");
-                let fallback = provider
+                let fallback = runtime
+                    .provider
                     .generate_chat_with_timeout(
                         prompt,
                         images,
-                        Duration::from_secs(self.config.fallback_timeout_seconds),
+                        Duration::from_secs(runtime.config.fallback_timeout_seconds),
                     )
                     .await
                     .map_err(|fallback_error| {
@@ -346,7 +383,7 @@ impl AiPlugin {
             format!("开启（{} 轮）", runtime.context_turns)
         };
         format!(
-            "🤖 **telebot AI**\n\n- 服务商：`{}`（Gemini 兼容）\n- BaseURL：`{}`\n- Key：**{}**\n- 主模型：`{}`\n- 原生搜索备用模型：`{}`\n- 原生搜索：`Google Search / Interactions API`\n- 思考等级：`{}`\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**{}**\n- 回复消息：作为本次请求上下文\n- Q/A 引用折叠：{}\n- 原生搜索总时限：{} 秒\n- 慢请求切备用模型：{} 秒\n- 无搜索兜底时限：{} 秒\n- 并发上限：{}",
+            "🤖 **telebot AI**\n\n- 服务商：`{}`（Gemini 兼容）\n- BaseURL：`{}`\n- Key：**{}**\n- 主模型：`{}`\n- 原生搜索备用模型：`{}`\n- 原生搜索：`Google Search / Interactions API`\n- 思考等级：`{}`\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**{}**\n- 回复消息：作为本次请求上下文\n- Q/A 引用折叠：{}\n- 纯文字搜索总时限：{} 秒\n- 带图搜索总时限：{} 秒\n- 慢请求切备用模型：{} 秒\n- 无搜索兜底时限：{} 秒\n- 最大输出：{} Token\n- 系统提示词：{} 字\n- 搜索进度：{}\n- 思考进度：{}\n- 并发上限：{}（修改后需重启）",
             runtime.provider_name,
             runtime.base_url,
             if runtime.key_overridden {
@@ -356,32 +393,89 @@ impl AiPlugin {
             },
             runtime.primary_model,
             runtime.search_fallback_model,
-            self.config.thinking_level,
-            if self.config.default_search {
+            runtime.config.thinking_level,
+            if runtime.config.default_search {
                 "开启"
             } else {
                 "关闭"
             },
             context,
-            if self.config.collapse_long_messages {
+            if runtime.config.collapse_long_messages {
                 "开启"
             } else {
                 "关闭"
             },
-            self.config.search_timeout_seconds,
-            self.config.search_hedge_seconds,
-            self.config.fallback_timeout_seconds,
-            self.config.max_concurrent,
+            runtime.config.search_timeout_seconds,
+            runtime.config.image_search_timeout_seconds,
+            runtime.config.search_hedge_seconds,
+            runtime.config.fallback_timeout_seconds,
+            runtime.config.max_output_tokens,
+            runtime.config.system_prompt.chars().count(),
+            runtime.messages.ai_searching,
+            runtime.messages.ai_thinking,
+            runtime.config.max_concurrent,
         )
     }
 
     async fn show_help(&self, context: &CommandContext) -> Result<()> {
-        replace_with_markdown(
-            &context.client,
-            &context.message,
-            "# 🤖 telebot AI\n\n- `.ai <问题>` — 默认联网搜索\n- `.ai` — 回复消息时直接分析被回复内容\n- `.ai search <问题>` — 强制联网搜索\n- `.ai chat <问题>` — 不联网回答\n- `.ai status` / `.ai config` — 查看当前配置\n- `.ai config provider <名称> <BaseURL>` — 设置 Gemini 兼容服务商\n- `.ai config key <Key>` — 设置 Key（仅收藏夹）\n- `.ai config model <主模型> [搜索备用模型]`\n- `.ai context <0-20|on|off>` — 配置按聊天保存的上下文\n- `.ai config reset` — 恢复服务器配置\n- `.ai reset` — 清除当前聊天上下文\n\n> 配置修改仅允许在收藏夹执行；Key 不会回显。上下文默认关闭。",
-        )
-        .await
+        let runtime = self.runtime.read().await;
+        let default_mode = if runtime.config.default_search {
+            "联网搜索"
+        } else {
+            "普通回答"
+        };
+        let help = format!(
+            "# 🤖 TeleBot AI 帮助\n\n\
+## 基本用法\n\n\
+- `.ai <问题>` — 按当前默认模式回答；现在默认是 **{default_mode}**。\n\
+- `.ai search <问题>` / `.ai s <问题>` — 强制使用 Gemini 原生 Google Search。\n\
+- `.ai chat <问题>` / `.ai c <问题>` — 强制不联网，直接使用模型回答。\n\
+- `.ai status` / `.ai config` — 查看当前生效配置，不显示 Key 内容。\n\
+- `.ai help` / `.ai ?` — 显示本帮助。\n\n\
+## 回复消息与图片\n\n\
+- 回复一条文字消息再发送 `.ai`：把被回复文字作为问题。\n\
+- 回复图片、静态贴纸或带图消息：图片会一并交给 Gemini。\n\
+- 回复图片后发送 `.ai <问题>`：结合图片和你的问题联网搜索。\n\
+- 回复图片后发送 `.ai chat <问题>`：结合图片回答，但不联网。\n\
+- 最多处理 4 张图片；单张不超过 8 MiB，总计不超过 12 MiB。\n\n\
+## 上下文记忆\n\n\
+- `.ai context` — 查看当前聊天的上下文设置。\n\
+- `.ai context on` — 开启默认 6 轮上下文。\n\
+- `.ai context <1-20>` — 设置保留轮数。\n\
+- `.ai context off` — 停止继续使用上下文。\n\
+- `.ai reset` — 清除当前聊天已经保存的上下文。\n\n\
+## 动态配置（仅限收藏夹）\n\n\
+- `.ai config provider <名称> <BaseURL>` — 更换 Gemini 兼容服务商。\n\
+- `.ai config key <Key>` — 设置并持久化 Key；消息会先被隐藏，Key 不回显。\n\
+- `.ai config clear-key` — 改回服务器环境变量中的 Key。\n\
+- `.ai config model <主模型> [搜索备用模型]` — 更换模型。\n\
+- `.ai config prompt <系统提示词>` — 修改系统提示词。\n\
+- `.ai config thinking <minimal|low|medium|high>` — 修改思考等级。\n\
+- `.ai config search <on|off>` — 设置裸 `.ai` 是否默认联网。\n\
+- `.ai config timeout <文字秒> <图片秒> <切备用秒> <兜底秒>` — 修改四类时限。\n\
+- `.ai config tokens <1-65536>` — 修改最大输出 Token。\n\
+- `.ai config collapse <on|off>` — 设置 Q/A 是否使用可折叠引用。\n\
+- `.ai config message searching <文案>` — 修改搜索进度文案。\n\
+- `.ai config message thinking <文案>` — 修改思考进度文案。\n\
+- `.ai config reload` — 重新读取服务器 TOML；SQLite 动态覆盖仍优先。\n\
+- `.ai config reset` — 清除全部 AI 动态覆盖，恢复服务器 TOML。\n\n\
+## 当前关键参数\n\n\
+- 主模型：`{}`\n\
+- 搜索备用：`{}`\n\
+- 思考等级：`{}`\n\
+- 文字/带图搜索时限：`{}` / `{}` 秒\n\
+- 搜索进度：{}\n\
+- 思考进度：{}\n\n\
+> 配置修改会立即生效并保存到本机 SQLite，不需要重新编译。服务商、BaseURL、模型和 Key 会先验证格式；危险或无效值会被拒绝。",
+            runtime.primary_model,
+            runtime.search_fallback_model,
+            runtime.config.thinking_level,
+            runtime.config.search_timeout_seconds,
+            runtime.config.image_search_timeout_seconds,
+            runtime.messages.ai_searching,
+            runtime.messages.ai_thinking,
+        );
+        replace_with_markdown(&context.client, &context.message, &help).await
     }
 
     async fn ensure_saved_messages(&self, context: &CommandContext) -> Result<()> {
@@ -446,18 +540,10 @@ impl AiPlugin {
                     bail!("用法：.ai config provider <名称> <BaseURL>");
                 }
                 let current = self.runtime.read().await.clone();
-                let updated = AiRuntime::build(
-                    &self.config,
-                    AiRuntimeOptions {
-                        provider_name: args[1].clone(),
-                        base_url: args[2].clone(),
-                        api_key: current.api_key,
-                        primary_model: current.primary_model,
-                        search_fallback_model: current.search_fallback_model,
-                        context_turns: current.context_turns,
-                        key_overridden: current.key_overridden,
-                    },
-                )?;
+                let mut options = AiRuntimeOptions::from(&current);
+                options.provider_name = args[1].clone();
+                options.base_url = args[2].clone();
+                let updated = AiRuntime::build(options)?;
                 self.store
                     .set_setting(AI_PROVIDER_SETTING, &updated.provider_name)
                     .await?;
@@ -468,7 +554,7 @@ impl AiPlugin {
                     "✅ 服务商已设置为 {}\nBaseURL：{}",
                     updated.provider_name, updated.base_url
                 );
-                *self.runtime.write().await = updated;
+                self.install_runtime(updated).await;
                 replace_with_chunks(&context.client, &context.message, &message).await
             }
             "key" => {
@@ -477,16 +563,12 @@ impl AiPlugin {
                 }
                 validate_api_key(&args[1])?;
                 let current = self.runtime.read().await.clone();
-                let updated = AiRuntime::build(
-                    &self.config,
-                    AiRuntimeOptions {
-                        api_key: args[1].clone(),
-                        key_overridden: true,
-                        ..AiRuntimeOptions::from(&current)
-                    },
-                )?;
+                let mut options = AiRuntimeOptions::from(&current);
+                options.api_key = args[1].clone();
+                options.key_overridden = true;
+                let updated = AiRuntime::build(options)?;
                 self.store.set_setting(AI_KEY_SETTING, &args[1]).await?;
-                *self.runtime.write().await = updated;
+                self.install_runtime(updated).await;
                 replace_with_chunks(
                     &context.client,
                     &context.message,
@@ -496,16 +578,13 @@ impl AiPlugin {
             }
             "clear-key" | "env-key" => {
                 let current = self.runtime.read().await.clone();
-                let updated = AiRuntime::build(
-                    &self.config,
-                    AiRuntimeOptions {
-                        api_key: self.env_api_key.clone(),
-                        key_overridden: false,
-                        ..AiRuntimeOptions::from(&current)
-                    },
-                )?;
+                let defaults = self.defaults.read().await.clone();
+                let mut options = AiRuntimeOptions::from(&current);
+                options.api_key = defaults.env_api_key;
+                options.key_overridden = false;
+                let updated = AiRuntime::build(options)?;
                 self.store.delete_setting(AI_KEY_SETTING).await?;
-                *self.runtime.write().await = updated;
+                self.install_runtime(updated).await;
                 replace_with_chunks(
                     &context.client,
                     &context.message,
@@ -522,14 +601,10 @@ impl AiPlugin {
                     .get(2)
                     .cloned()
                     .unwrap_or_else(|| current.search_fallback_model.clone());
-                let updated = AiRuntime::build(
-                    &self.config,
-                    AiRuntimeOptions {
-                        primary_model: args[1].clone(),
-                        search_fallback_model: search_model,
-                        ..AiRuntimeOptions::from(&current)
-                    },
-                )?;
+                let mut options = AiRuntimeOptions::from(&current);
+                options.primary_model = args[1].clone();
+                options.search_fallback_model = search_model;
+                let updated = AiRuntime::build(options)?;
                 self.store
                     .set_setting(AI_MODEL_SETTING, &updated.primary_model)
                     .await?;
@@ -540,24 +615,226 @@ impl AiPlugin {
                     "✅ AI 模型已更新\n主模型：{}\n搜索备用：{}",
                     updated.primary_model, updated.search_fallback_model
                 );
-                *self.runtime.write().await = updated;
+                self.install_runtime(updated).await;
                 replace_with_chunks(&context.client, &context.message, &message).await
             }
-            "reset" => {
-                let updated = AiRuntime::build(
-                    &self.config,
-                    AiRuntimeOptions {
-                        provider_name: default_provider_name(&self.config),
-                        base_url: self.config.base_url.clone(),
-                        api_key: self.env_api_key.clone(),
-                        primary_model: self.config.model.clone(),
-                        search_fallback_model: self.config.search_fallback_model.clone(),
-                        context_turns: self.config.history_turns,
-                        key_overridden: false,
+            "prompt" => {
+                if args.len() < 2 {
+                    bail!("用法：.ai config prompt <系统提示词>");
+                }
+                let value = args[1..].join(" ");
+                let current = self.runtime.read().await.clone();
+                let mut options = AiRuntimeOptions::from(&current);
+                options.config.system_prompt = value.clone();
+                let updated = AiRuntime::build(options)?;
+                self.store
+                    .set_setting(AI_SYSTEM_PROMPT_SETTING, &value)
+                    .await?;
+                self.install_runtime(updated).await;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    "✅ 系统提示词已更新并立即生效",
+                )
+                .await
+            }
+            "thinking" => {
+                if args.len() != 2 {
+                    bail!("用法：.ai config thinking <minimal|low|medium|high>");
+                }
+                let value = args[1].to_ascii_lowercase();
+                let current = self.runtime.read().await.clone();
+                let mut options = AiRuntimeOptions::from(&current);
+                options.config.thinking_level = value.clone();
+                let updated = AiRuntime::build(options)?;
+                self.store.set_setting(AI_THINKING_SETTING, &value).await?;
+                self.install_runtime(updated).await;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    &format!("✅ 思考等级已设置为 {value}"),
+                )
+                .await
+            }
+            "search" | "default-search" => {
+                if args.len() != 2 {
+                    bail!("用法：.ai config search <on|off>");
+                }
+                let enabled = parse_bool_setting("默认搜索", &args[1])?;
+                let current = self.runtime.read().await.clone();
+                let mut options = AiRuntimeOptions::from(&current);
+                options.config.default_search = enabled;
+                let updated = AiRuntime::build(options)?;
+                self.store
+                    .set_setting(
+                        AI_DEFAULT_SEARCH_SETTING,
+                        if enabled { "true" } else { "false" },
+                    )
+                    .await?;
+                self.install_runtime(updated).await;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    if enabled {
+                        "✅ 裸 .ai 已设置为默认联网搜索"
+                    } else {
+                        "✅ 裸 .ai 已设置为默认普通回答"
                     },
-                )?;
+                )
+                .await
+            }
+            "timeout" | "timeouts" => {
+                if args.len() != 5 {
+                    bail!("用法：.ai config timeout <文字秒> <图片秒> <切备用秒> <兜底秒>");
+                }
+                let text = parse_u64_setting("文字搜索时限", &args[1])?;
+                let image = parse_u64_setting("带图搜索时限", &args[2])?;
+                let hedge = parse_u64_setting("备用模型启动时限", &args[3])?;
+                let fallback = parse_u64_setting("无搜索兜底时限", &args[4])?;
+                let current = self.runtime.read().await.clone();
+                let mut options = AiRuntimeOptions::from(&current);
+                options.config.search_timeout_seconds = text;
+                options.config.image_search_timeout_seconds = image;
+                options.config.search_hedge_seconds = hedge;
+                options.config.fallback_timeout_seconds = fallback;
+                let updated = AiRuntime::build(options)?;
+                self.store
+                    .set_setting(AI_SEARCH_TIMEOUT_SETTING, &text.to_string())
+                    .await?;
+                self.store
+                    .set_setting(AI_IMAGE_SEARCH_TIMEOUT_SETTING, &image.to_string())
+                    .await?;
+                self.store
+                    .set_setting(AI_SEARCH_HEDGE_SETTING, &hedge.to_string())
+                    .await?;
+                self.store
+                    .set_setting(AI_FALLBACK_TIMEOUT_SETTING, &fallback.to_string())
+                    .await?;
+                self.install_runtime(updated).await;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    &format!(
+                        "✅ AI 时限已更新\n文字：{text} 秒\n图片：{image} 秒\n切备用：{hedge} 秒\n兜底：{fallback} 秒"
+                    ),
+                )
+                .await
+            }
+            "tokens" | "max-tokens" => {
+                if args.len() != 2 {
+                    bail!("用法：.ai config tokens <1-65536>");
+                }
+                let value = parse_u32_setting("最大输出 Token", &args[1])?;
+                let current = self.runtime.read().await.clone();
+                let mut options = AiRuntimeOptions::from(&current);
+                options.config.max_output_tokens = value;
+                let updated = AiRuntime::build(options)?;
+                self.store
+                    .set_setting(AI_MAX_OUTPUT_TOKENS_SETTING, &value.to_string())
+                    .await?;
+                self.install_runtime(updated).await;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    &format!("✅ 最大输出已设置为 {value} Token"),
+                )
+                .await
+            }
+            "collapse" => {
+                if args.len() != 2 {
+                    bail!("用法：.ai config collapse <on|off>");
+                }
+                let enabled = parse_bool_setting("Q/A 引用折叠", &args[1])?;
+                let current = self.runtime.read().await.clone();
+                let mut options = AiRuntimeOptions::from(&current);
+                options.config.collapse_long_messages = enabled;
+                let updated = AiRuntime::build(options)?;
+                self.store
+                    .set_setting(AI_COLLAPSE_SETTING, if enabled { "true" } else { "false" })
+                    .await?;
+                self.install_runtime(updated).await;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    if enabled {
+                        "✅ Q/A 可折叠引用已开启"
+                    } else {
+                        "✅ Q/A 可折叠引用已关闭"
+                    },
+                )
+                .await
+            }
+            "message" | "messages" => {
+                if args.len() < 3 {
+                    bail!("用法：.ai config message <searching|thinking> <文案>");
+                }
+                let kind = args[1].to_ascii_lowercase();
+                let value = args[2..].join(" ");
+                let current = self.runtime.read().await.clone();
+                let mut options = AiRuntimeOptions::from(&current);
+                let setting = match kind.as_str() {
+                    "searching" | "search" => {
+                        options.messages.ai_searching = value.clone();
+                        AI_SEARCHING_MESSAGE_SETTING
+                    }
+                    "thinking" | "think" => {
+                        options.messages.ai_thinking = value.clone();
+                        AI_THINKING_MESSAGE_SETTING
+                    }
+                    _ => bail!("文案名称只能是 searching 或 thinking"),
+                };
+                let updated = AiRuntime::build(options)?;
+                self.store.set_setting(setting, &value).await?;
+                self.install_runtime(updated).await;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    &format!("✅ {kind} 进度文案已更新为：{value}"),
+                )
+                .await
+            }
+            "reload" => {
+                if args.len() != 1 {
+                    bail!("用法：.ai config reload");
+                }
+                let loaded = Config::load(&self.config_path)?;
+                if !loaded.ai.enabled {
+                    bail!("服务器配置已关闭 AI；停用插件需要重启服务");
+                }
+                let secrets = loaded.load_secrets()?;
+                let current_defaults = self.defaults.read().await.clone();
+                let mut config = loaded.ai;
+                config.max_concurrent = current_defaults.config.max_concurrent;
+                let defaults = AiDefaults {
+                    config,
+                    messages: loaded.messages,
+                    env_api_key: secrets.ai_api_key.context("AI Key 未配置")?,
+                };
+                let updated = runtime_from_store(&defaults, &self.store).await?;
+                *self.defaults.write().await = defaults;
+                self.install_runtime(updated).await;
+                replace_with_chunks(
+                    &context.client,
+                    &context.message,
+                    "✅ 已重新读取服务器 AI 与文案配置；SQLite 动态覆盖保持优先。并发上限和插件启停仍需重启服务。",
+                )
+                .await
+            }
+            "reset" => {
+                let defaults = self.defaults.read().await.clone();
+                let updated = AiRuntime::build(AiRuntimeOptions {
+                    provider_name: default_provider_name(&defaults.config),
+                    base_url: defaults.config.base_url.clone(),
+                    api_key: defaults.env_api_key.clone(),
+                    primary_model: defaults.config.model.clone(),
+                    search_fallback_model: defaults.config.search_fallback_model.clone(),
+                    context_turns: defaults.config.history_turns,
+                    key_overridden: false,
+                    config: defaults.config,
+                    messages: defaults.messages,
+                })?;
                 self.store.delete_settings_prefix(AI_SETTING_PREFIX).await?;
-                *self.runtime.write().await = updated;
+                self.install_runtime(updated).await;
                 replace_with_chunks(
                     &context.client,
                     &context.message,
@@ -565,9 +842,157 @@ impl AiPlugin {
                 )
                 .await
             }
-            _ => bail!("未知配置项；可用：provider、key、clear-key、model、context、reset"),
+            _ => bail!(
+                "未知配置项；可用：provider、key、clear-key、model、prompt、thinking、search、timeout、tokens、collapse、message、context、reload、reset"
+            ),
         }
     }
+}
+
+fn effective_search_timeout_seconds(config: &AiConfig, images: &[AiImage]) -> u64 {
+    if images.is_empty() {
+        config.search_timeout_seconds
+    } else {
+        config.image_search_timeout_seconds
+    }
+}
+
+fn progress_from_runtime(runtime: &AiRuntime) -> AiProgressConfig {
+    AiProgressConfig::new(&runtime.config, &runtime.messages)
+}
+
+async fn runtime_from_store(defaults: &AiDefaults, store: &Store) -> Result<AiRuntime> {
+    let mut config = defaults.config.clone();
+    let mut messages = defaults.messages.clone();
+
+    if let Some(value) = store.get_setting(AI_THINKING_SETTING).await? {
+        config.thinking_level = value;
+    }
+    if let Some(value) = store.get_setting(AI_DEFAULT_SEARCH_SETTING).await? {
+        config.default_search = parse_bool_setting("默认搜索", &value)?;
+    }
+    if let Some(value) = store.get_setting(AI_SYSTEM_PROMPT_SETTING).await? {
+        config.system_prompt = value;
+    }
+    if let Some(value) = store.get_setting(AI_MAX_OUTPUT_TOKENS_SETTING).await? {
+        config.max_output_tokens = parse_u32_setting("最大输出 Token", &value)?;
+    }
+    if let Some(value) = store.get_setting(AI_SEARCH_TIMEOUT_SETTING).await? {
+        config.search_timeout_seconds = parse_u64_setting("文字搜索时限", &value)?;
+    }
+    if let Some(value) = store.get_setting(AI_IMAGE_SEARCH_TIMEOUT_SETTING).await? {
+        config.image_search_timeout_seconds = parse_u64_setting("带图搜索时限", &value)?;
+    }
+    if let Some(value) = store.get_setting(AI_SEARCH_HEDGE_SETTING).await? {
+        config.search_hedge_seconds = parse_u64_setting("备用模型启动时限", &value)?;
+    }
+    if let Some(value) = store.get_setting(AI_FALLBACK_TIMEOUT_SETTING).await? {
+        config.fallback_timeout_seconds = parse_u64_setting("无搜索兜底时限", &value)?;
+    }
+    if let Some(value) = store.get_setting(AI_COLLAPSE_SETTING).await? {
+        config.collapse_long_messages = parse_bool_setting("Q/A 引用折叠", &value)?;
+    }
+    if let Some(value) = store.get_setting(AI_SEARCHING_MESSAGE_SETTING).await? {
+        messages.ai_searching = value;
+    }
+    if let Some(value) = store.get_setting(AI_THINKING_MESSAGE_SETTING).await? {
+        messages.ai_thinking = value;
+    }
+
+    let provider_name = store
+        .get_setting(AI_PROVIDER_SETTING)
+        .await?
+        .unwrap_or_else(|| default_provider_name(&config));
+    let base_url = store
+        .get_setting(AI_BASE_URL_SETTING)
+        .await?
+        .unwrap_or_else(|| config.base_url.clone());
+    let key_override = store.get_setting(AI_KEY_SETTING).await?;
+    let key_overridden = key_override.is_some();
+    let api_key = key_override.unwrap_or_else(|| defaults.env_api_key.clone());
+    let primary_model = store
+        .get_setting(AI_MODEL_SETTING)
+        .await?
+        .unwrap_or_else(|| config.model.clone());
+    let search_fallback_model = store
+        .get_setting(AI_SEARCH_MODEL_SETTING)
+        .await?
+        .unwrap_or_else(|| config.search_fallback_model.clone());
+    let context_turns = match store.get_setting(AI_CONTEXT_SETTING).await? {
+        Some(value) => parse_context_turns(&value)?,
+        None => config.history_turns,
+    };
+
+    AiRuntime::build(AiRuntimeOptions {
+        provider_name,
+        base_url,
+        api_key,
+        primary_model,
+        search_fallback_model,
+        context_turns,
+        key_overridden,
+        config,
+        messages,
+    })
+}
+
+fn validate_runtime_config(config: &AiConfig, messages: &MessagesConfig) -> Result<()> {
+    if !matches!(
+        config.thinking_level.as_str(),
+        "minimal" | "low" | "medium" | "high"
+    ) {
+        bail!("思考等级只能是 minimal、low、medium 或 high");
+    }
+    let prompt_length = config.system_prompt.chars().count();
+    if config.system_prompt.trim().is_empty() || prompt_length > 16_000 {
+        bail!("系统提示词必须为 1 到 16000 个字符");
+    }
+    if !(1..=65_536).contains(&config.max_output_tokens) {
+        bail!("最大输出 Token 必须在 1 到 65536 之间");
+    }
+    if !(3..=120).contains(&config.search_timeout_seconds)
+        || !(3..=120).contains(&config.image_search_timeout_seconds)
+        || !(3..=120).contains(&config.fallback_timeout_seconds)
+    {
+        bail!("AI 时限必须在 3 到 120 秒之间");
+    }
+    if config.image_search_timeout_seconds < config.search_timeout_seconds {
+        bail!("带图搜索时限不能短于文字搜索时限");
+    }
+    if !(3..config.search_timeout_seconds).contains(&config.search_hedge_seconds) {
+        bail!("备用模型启动时限必须至少 3 秒，并且短于文字搜索总时限");
+    }
+    validate_runtime_message("搜索进度文案", &messages.ai_searching)?;
+    validate_runtime_message("思考进度文案", &messages.ai_thinking)?;
+    Ok(())
+}
+
+fn validate_runtime_message(name: &str, value: &str) -> Result<()> {
+    let length = value.chars().count();
+    if value.trim().is_empty() || length > 128 || value.contains('\r') || value.contains('\n') {
+        bail!("{name}必须是 1 到 128 个字符的单行文本");
+    }
+    Ok(())
+}
+
+fn parse_bool_setting(name: &str, value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "开启" | "开" => Ok(true),
+        "0" | "false" | "off" | "no" | "关闭" | "关" => Ok(false),
+        _ => bail!("{name}只接受 on/off"),
+    }
+}
+
+fn parse_u64_setting(name: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("{name}必须是整数"))
+}
+
+fn parse_u32_setting(name: &str, value: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .with_context(|| format!("{name}必须是整数"))
 }
 
 #[async_trait]
@@ -618,18 +1043,19 @@ impl Plugin for AiPlugin {
             _ => {}
         }
 
+        let runtime = self.runtime.read().await.clone();
         let (use_search, explicit_question) = match first.to_ascii_lowercase().as_str() {
             "search" | "s" => (true, rest.to_owned()),
             "chat" | "c" => (false, rest.to_owned()),
-            _ => (self.config.default_search, raw.to_owned()),
+            _ => (runtime.config.default_search, raw.to_owned()),
         };
         let preparation_started = Instant::now();
         edit_progress(
             &context.message,
             if use_search {
-                "🔎 正在联网搜索…"
+                &runtime.messages.ai_searching
             } else {
-                "💭 正在思考…"
+                &runtime.messages.ai_thinking
             },
         )
         .await?;
@@ -865,10 +1291,7 @@ async fn download_ai_image(
     let path = temporary.path().join(format!("{label}.bin"));
     let mime_type = match &media {
         Media::Photo(photo) => {
-            client
-                .download_media(photo, &path)
-                .await
-                .context("下载回复图片失败")?;
+            download_ai_photo(client, photo, &path).await?;
             "image/jpeg".to_owned()
         }
         Media::Sticker(sticker) => {
@@ -897,7 +1320,7 @@ async fn download_ai_image(
     };
     let metadata = tokio::fs::metadata(&path).await?;
     if metadata.len() == 0 {
-        bail!("回复图片为空");
+        bail!("Telegram 未返回可用的图片数据，请重新发送图片后重试");
     }
     if metadata.len() > MAX_AI_IMAGE_BYTES {
         bail!("单张图片超过 8 MB，请压缩后重试");
@@ -908,6 +1331,53 @@ async fn download_ai_image(
         base64_data: base64::engine::general_purpose::STANDARD.encode(&bytes),
         byte_len: bytes.len(),
     }))
+}
+
+async fn download_ai_photo(client: &Client, photo: &Photo, path: &Path) -> Result<()> {
+    let mut variants = photo
+        .thumbs()
+        .into_iter()
+        .filter(|variant| !matches!(variant, PhotoSize::Empty(_) | PhotoSize::Path(_)))
+        .collect::<Vec<_>>();
+    variants.sort_by_key(|variant| std::cmp::Reverse(variant.size()));
+
+    let variant_count = variants.len();
+    let mut failed_attempts = 0usize;
+    for variant in variants {
+        match client.download_media(&variant, path).await {
+            Ok(()) => {
+                let byte_len = tokio::fs::metadata(path).await?.len();
+                if byte_len > 0 {
+                    if failed_attempts > 0 {
+                        warn!(
+                            photo_id = photo.id(),
+                            byte_len,
+                            failed_attempts,
+                            variant_count,
+                            "AI photo download recovered with another Telegram size"
+                        );
+                    }
+                    return Ok(());
+                }
+                failed_attempts += 1;
+            }
+            Err(error) => {
+                failed_attempts += 1;
+                warn!(
+                    photo_id = photo.id(),
+                    failed_attempts,
+                    variant_count,
+                    %error,
+                    "AI photo size download failed; trying another size"
+                );
+            }
+        }
+    }
+
+    client
+        .download_media(photo, path)
+        .await
+        .context("下载回复图片失败")
 }
 
 fn split_first(input: &str) -> (&str, &str) {
@@ -1380,5 +1850,54 @@ mod tests {
         assert!(prompt.contains("用户：第一问"));
         assert!(prompt.contains("助手：第一答"));
         assert!(prompt.ends_with("当前请求：\n第二问"));
+    }
+
+    #[test]
+    fn image_requests_use_the_dedicated_search_timeout() {
+        let parsed: crate::config::Config =
+            toml::from_str(include_str!("../../config.example.toml"))
+                .expect("example config should deserialize");
+        let mut config = parsed.ai;
+        assert_eq!(effective_search_timeout_seconds(&config, &[]), 20);
+
+        config.image_search_timeout_seconds = 30;
+        let image = AiImage {
+            mime_type: "image/jpeg".to_owned(),
+            base64_data: String::new(),
+            byte_len: 0,
+        };
+        assert_eq!(effective_search_timeout_seconds(&config, &[image]), 30);
+    }
+
+    #[tokio::test]
+    async fn runtime_tuning_and_progress_messages_load_from_sqlite() {
+        let parsed: crate::config::Config =
+            toml::from_str(include_str!("../../config.example.toml")).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let store = Store::open(&temporary.path().join("runtime.db"))
+            .await
+            .unwrap();
+        store
+            .set_setting(AI_DEFAULT_SEARCH_SETTING, "false")
+            .await
+            .unwrap();
+        store
+            .set_setting(AI_THINKING_SETTING, "minimal")
+            .await
+            .unwrap();
+        store
+            .set_setting(AI_SEARCHING_MESSAGE_SETTING, "🔍 正在查找资料…")
+            .await
+            .unwrap();
+        let defaults = AiDefaults {
+            config: parsed.ai,
+            messages: parsed.messages,
+            env_api_key: "test-key".to_owned(),
+        };
+        let runtime = runtime_from_store(&defaults, &store).await.unwrap();
+        assert!(!runtime.config.default_search);
+        assert_eq!(runtime.config.thinking_level, "minimal");
+        assert_eq!(runtime.messages.ai_searching, "🔍 正在查找资料…");
+        assert_eq!(progress_from_runtime(&runtime).thinking, "💭 正在思考…");
     }
 }

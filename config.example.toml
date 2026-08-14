@@ -27,8 +27,14 @@ collapse_threshold_chars = 400
 max_output_tokens = 4096
 max_concurrent = 3
 search_timeout_seconds = 20
+# 带图联网通常更慢；仅图片请求使用这个总时限，纯文字仍使用上面的 20 秒。
+image_search_timeout_seconds = 30
 search_hedge_seconds = 10
 fallback_timeout_seconds = 10
+
+[messages]
+ai_searching = "🔎 正在搜索…"
+ai_thinking = "💭 正在思考…"
 
 [quote]
 enabled = true

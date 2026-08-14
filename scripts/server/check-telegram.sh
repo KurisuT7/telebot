@@ -4,8 +4,15 @@ set -eu
 mode=${1:-all}
 case "$mode" in
   session|format|plugins|all) ;;
+  image)
+    if [ "$#" -ne 2 ]; then
+      echo "usage: check-telegram.sh image /path/to/test-image" >&2
+      exit 2
+    fi
+    image=$2
+    ;;
   *)
-    echo "usage: check-telegram.sh [session|format|plugins|all]" >&2
+    echo "usage: check-telegram.sh [session|format|plugins|all|image /path/to/test-image]" >&2
     exit 2
     ;;
 esac
@@ -60,6 +67,9 @@ case "$mode" in
     ;;
   plugins)
     "$binary" check-telegram-plugins --config "$config"
+    ;;
+  image)
+    "$binary" check-telegram-image --config "$config" --image "$image"
     ;;
   all)
     "$binary" check-session --config "$config"

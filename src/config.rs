@@ -97,10 +97,6 @@ impl AiApiFormat {
             Self::OpenaiResponses => "openai_responses",
         }
     }
-
-    pub const fn supports_native_search(self) -> bool {
-        matches!(self, Self::GeminiInteractions | Self::OpenaiResponses)
-    }
 }
 
 impl FromStr for AiApiFormat {
@@ -211,11 +207,6 @@ impl Config {
             {
                 bail!("AI key, base URL, and model settings must not be empty");
             }
-            if self.ai.api_format.supports_native_search()
-                && self.ai.search_fallback_model.trim().is_empty()
-            {
-                bail!("ai.search_fallback_model is required for native-search API formats");
-            }
             if !matches!(
                 self.ai.thinking_level.as_str(),
                 "minimal" | "low" | "medium" | "high"
@@ -240,8 +231,10 @@ impl Config {
             if self.ai.image_search_timeout_seconds < self.ai.search_timeout_seconds {
                 bail!("ai.image_search_timeout_seconds must be at least search timeout");
             }
-            if !(3..self.ai.search_timeout_seconds).contains(&self.ai.search_hedge_seconds) {
-                bail!("ai.search_hedge_seconds must be at least 3 and below search timeout");
+            if self.ai.search_hedge_seconds != 0
+                && !(3..self.ai.search_timeout_seconds).contains(&self.ai.search_hedge_seconds)
+            {
+                bail!("ai.search_hedge_seconds must be 0, or at least 3 and below search timeout");
             }
         }
         validate_progress_message("messages.ai_searching", &self.messages.ai_searching)?;
@@ -320,7 +313,7 @@ fn default_gemini_base_url() -> String {
     "https://generativelanguage.googleapis.com".to_owned()
 }
 fn default_search_fallback_model() -> String {
-    "gemini-3.1-flash-lite".to_owned()
+    String::new()
 }
 fn default_thinking_level() -> String {
     "minimal".to_owned()
@@ -355,7 +348,7 @@ fn default_image_search_timeout() -> u64 {
     30
 }
 fn default_search_hedge() -> u64 {
-    10
+    3
 }
 fn default_fallback_timeout() -> u64 {
     10
@@ -427,6 +420,18 @@ mod tests {
         parsed.validate().unwrap();
         assert_eq!(parsed.ai.provider, "generic-oai");
         assert_eq!(parsed.ai.api_format, AiApiFormat::OpenaiChatCompletions);
+    }
+
+    #[test]
+    fn native_search_can_use_only_the_primary_model() {
+        let raw = include_str!("../config.example.toml").replace("api_id = 0", "api_id = 1");
+        let mut parsed: Config = toml::from_str(&raw).unwrap();
+        parsed.validate().unwrap();
+        assert!(parsed.ai.search_fallback_model.is_empty());
+        assert_eq!(parsed.ai.search_hedge_seconds, 3);
+
+        parsed.ai.search_hedge_seconds = 0;
+        parsed.validate().unwrap();
     }
 
     #[test]

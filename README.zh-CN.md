@@ -15,7 +15,7 @@
 - `.q`：把一至五条消息生成 WebP 贴纸或 PNG 图片，并可保存到贴纸包。
 - 支持 Gemini Interactions、OpenAI Chat Completions 和 OpenAI Responses 三种 API 格式。
 - 模型、接口地址、Key、超时和提示词等常用设置可以直接在 Telegram 收藏夹中修改。
-- 同时执行的命令数量有限制；短暂重启期间收到的命令会在恢复后继续处理；联网搜索等主模型过久时会自动尝试备用模型。
+- 同时执行的命令数量有限制；短暂重启期间收到的命令会在恢复后继续处理；联网搜索过慢时会并发重试。
 
 ## 开始前
 
@@ -127,7 +127,7 @@ api_format = "openai_chat_completions"
 api_key_env = "TELEBOT_AI_API_KEY"
 base_url = "https://api.example.com/v1"
 model = "example-model"
-search_fallback_model = "example-model"
+search_fallback_model = ""
 default_search = false
 ```
 
@@ -135,21 +135,22 @@ default_search = false
 `chat/completions` 或 `responses`。只有服务端确实实现 Responses API 时才选择
 `openai_responses`。
 
-对于支持联网搜索的格式，如果主模型在 `search_hedge_seconds` 内没有完成，telebot 会同时
-尝试 `search_fallback_model`，并采用先成功的结果。带图请求有单独的
-`image_search_timeout_seconds`，不会拉长纯文字请求的等待上限。
+对于支持联网搜索的格式，如果主请求在 `search_hedge_seconds` 内没有完成，telebot 会再发起
+一次请求，并采用先成功的结果。`search_fallback_model` 留空时，两次请求使用同一个主模型；
+填写模型名后，第二次请求才会改用该模型。将 `search_hedge_seconds` 设为 `0` 可以关闭抢跑。
+带图请求有单独的 `image_search_timeout_seconds`，不会拉长纯文字请求的等待上限。
 
 ## 运行中修改 AI 设置
 
 以下命令只能在 Telegram 收藏夹中使用，修改后立即生效：
 
 - `.ai config provider <API格式> <名称> <BaseURL>`
-- `.ai config model <主模型> [搜索备用模型]`
+- `.ai config model <主模型> [搜索备用模型|off]`
 - `.ai config key <Key>` / `.ai config clear-key`
 - `.ai config prompt <系统提示词>`
 - `.ai config thinking <minimal|low|medium|high>`
 - `.ai config search <on|off>`
-- `.ai config timeout <文字秒> <图片秒> <切备用秒> <兜底秒>`
+- `.ai config timeout <文字秒> <图片秒> <抢跑秒> <兜底秒>`
 - `.ai config tokens <1-65536>`
 - `.ai config collapse <on|off>`
 - `.ai config message searching|thinking <文案>`

@@ -60,7 +60,8 @@ sudo install -m 0600 deploy/telebot.env.example /etc/telebot/telebot.env
 在 `/etc/telebot/config.toml` 中至少修改：
 
 - `telegram.api_id`；
-- `ai.api_format`、`ai.base_url`、`ai.model` 和 `ai.search_fallback_model`；
+- `ai.api_format`、`ai.base_url` 和 `ai.model`；只有需要第二个搜索模型时才填写
+  `ai.search_fallback_model`；
 - 如果不使用 Gemini 示例，把 `ai.api_key_env` 改成自己的环境变量名。
 
 在 `/etc/telebot/telebot.env` 中填写：

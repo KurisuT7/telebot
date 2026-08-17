@@ -61,7 +61,8 @@ Skip `useradd` when the `telebot` account already exists.
 At minimum, change these values in `/etc/telebot/config.toml`:
 
 - `telegram.api_id`;
-- `ai.api_format`, `ai.base_url`, `ai.model`, and `ai.search_fallback_model`;
+- `ai.api_format`, `ai.base_url`, and `ai.model`; set `ai.search_fallback_model` only when the second
+  search request should use a different model;
 - `ai.api_key_env` when the Gemini example variable is not appropriate.
 
 Set the following in `/etc/telebot/telebot.env`:

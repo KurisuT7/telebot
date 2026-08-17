@@ -154,14 +154,10 @@ impl AiRuntime {
         let base_url = normalize_base_url(&base_url)?;
         validate_api_key(&api_key)?;
         validate_model("主模型", &primary_model)?;
-        let search_fallback_model = if search_fallback_model.trim().is_empty()
-            && api_format == AiApiFormat::OpenaiChatCompletions
-        {
-            primary_model.clone()
-        } else {
+        let search_fallback_model = search_fallback_model.trim().to_owned();
+        if !search_fallback_model.is_empty() {
             validate_model("搜索备用模型", &search_fallback_model)?;
-            search_fallback_model
-        };
+        }
         if context_turns > 20 {
             bail!("上下文轮数必须在 0 到 20 之间");
         }
@@ -428,8 +424,13 @@ impl AiPlugin {
         } else {
             format!("开启（{} 轮）", runtime.context_turns)
         };
+        let search_fallback = display_search_fallback(&runtime.search_fallback_model);
+        let search_hedge = display_search_hedge(
+            runtime.config.search_hedge_seconds,
+            &runtime.search_fallback_model,
+        );
         format!(
-            "🤖 **telebot AI**\n\n- 服务商：`{}`\n- API 格式：`{}`\n- BaseURL：`{}`\n- Key：**{}**\n- 主模型：`{}`\n- 搜索备用模型：`{}`\n- 原生搜索：`{}`\n- 思考等级：`{}`（仅 Gemini Interactions 使用）\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**{}**\n- 回复消息：作为本次请求上下文\n- Q/A 引用折叠：{}\n- 纯文字搜索总时限：{} 秒\n- 带图搜索总时限：{} 秒\n- 慢请求切备用模型：{} 秒\n- 无搜索兜底时限：{} 秒\n- 最大输出：{} Token\n- 系统提示词：{} 字\n- 搜索进度：{}\n- 思考进度：{}\n- 并发上限：{}（修改后需重启）",
+            "🤖 **telebot AI**\n\n- 服务商：`{}`\n- API 格式：`{}`\n- BaseURL：`{}`\n- Key：**{}**\n- 主模型：`{}`\n- 搜索备用模型：`{}`\n- 原生搜索：`{}`\n- 思考等级：`{}`（仅 Gemini Interactions 使用）\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**{}**\n- 回复消息：作为本次请求上下文\n- Q/A 引用折叠：{}\n- 纯文字搜索总时限：{} 秒\n- 带图搜索总时限：{} 秒\n- 慢请求抢跑：{}\n- 无搜索兜底时限：{} 秒\n- 最大输出：{} Token\n- 系统提示词：{} 字\n- 搜索进度：{}\n- 思考进度：{}\n- 并发上限：{}（修改后需重启）",
             runtime.provider_name,
             runtime.api_format.as_str(),
             runtime.base_url,
@@ -439,7 +440,7 @@ impl AiPlugin {
                 "使用服务器环境变量"
             },
             runtime.primary_model,
-            runtime.search_fallback_model,
+            search_fallback,
             native_search_description(runtime.api_format),
             runtime.config.thinking_level,
             if runtime.config.default_search {
@@ -455,7 +456,7 @@ impl AiPlugin {
             },
             runtime.config.search_timeout_seconds,
             runtime.config.image_search_timeout_seconds,
-            runtime.config.search_hedge_seconds,
+            search_hedge,
             runtime.config.fallback_timeout_seconds,
             runtime.config.max_output_tokens,
             runtime.config.system_prompt.chars().count(),
@@ -497,11 +498,11 @@ impl AiPlugin {
  - API 格式：`gemini_interactions`、`openai_chat_completions`、`openai_responses`。\n\
 - `.ai config key <Key>` — 设置并持久化 Key；消息会先被隐藏，Key 不回显。\n\
 - `.ai config clear-key` — 改回服务器环境变量中的 Key。\n\
-- `.ai config model <主模型> [搜索备用模型]` — 更换模型。\n\
+- `.ai config model <主模型> [搜索备用模型|off]` — 更换模型；`off` 只用主模型。\n\
 - `.ai config prompt <系统提示词>` — 修改系统提示词。\n\
 - `.ai config thinking <minimal|low|medium|high>` — 修改思考等级。\n\
 - `.ai config search <on|off>` — 设置裸 `.ai` 是否默认联网。\n\
-- `.ai config timeout <文字秒> <图片秒> <切备用秒> <兜底秒>` — 修改四类时限。\n\
+- `.ai config timeout <文字秒> <图片秒> <抢跑秒> <兜底秒>` — 修改四类时限；抢跑设为 0 可关闭。\n\
 - `.ai config tokens <1-65536>` — 修改最大输出 Token。\n\
 - `.ai config collapse <on|off>` — 设置 Q/A 是否使用可折叠引用。\n\
 - `.ai config message searching <文案>` — 修改搜索进度文案。\n\
@@ -511,13 +512,18 @@ impl AiPlugin {
 ## 当前关键参数\n\n\
 - 主模型：`{}`\n\
 - 搜索备用：`{}`\n\
+- 慢请求抢跑：{}\n\
 - 思考等级：`{}`\n\
 - 文字/带图搜索时限：`{}` / `{}` 秒\n\
 - 搜索进度：{}\n\
 - 思考进度：{}\n\n\
 > 配置修改会立即生效并保存到本机 SQLite，不需要重新编译。服务商、BaseURL、模型和 Key 会先验证格式；危险或无效值会被拒绝。",
             runtime.primary_model,
-            runtime.search_fallback_model,
+            display_search_fallback(&runtime.search_fallback_model),
+            display_search_hedge(
+                runtime.config.search_hedge_seconds,
+                &runtime.search_fallback_model,
+            ),
             runtime.config.thinking_level,
             runtime.config.search_timeout_seconds,
             runtime.config.image_search_timeout_seconds,
@@ -654,12 +660,15 @@ impl AiPlugin {
             }
             "model" => {
                 if !(2..=3).contains(&args.len()) {
-                    bail!("用法：.ai config model <主模型> [搜索备用模型]");
+                    bail!("用法：.ai config model <主模型> [搜索备用模型|off]");
                 }
                 let current = self.runtime.read().await.clone();
                 let search_model = args
                     .get(2)
-                    .cloned()
+                    .map(|value| match value.to_ascii_lowercase().as_str() {
+                        "off" | "none" | "-" | "关闭" => String::new(),
+                        _ => value.clone(),
+                    })
                     .unwrap_or_else(|| current.search_fallback_model.clone());
                 let mut options = AiRuntimeOptions::from(&current);
                 options.primary_model = args[1].clone();
@@ -673,7 +682,8 @@ impl AiPlugin {
                     .await?;
                 let message = format!(
                     "✅ AI 模型已更新\n主模型：{}\n搜索备用：{}",
-                    updated.primary_model, updated.search_fallback_model
+                    updated.primary_model,
+                    display_search_fallback(&updated.search_fallback_model)
                 );
                 self.install_runtime(updated).await;
                 replace_with_chunks(&context.client, &context.message, &message).await
@@ -745,11 +755,11 @@ impl AiPlugin {
             }
             "timeout" | "timeouts" => {
                 if args.len() != 5 {
-                    bail!("用法：.ai config timeout <文字秒> <图片秒> <切备用秒> <兜底秒>");
+                    bail!("用法：.ai config timeout <文字秒> <图片秒> <抢跑秒> <兜底秒>");
                 }
                 let text = parse_u64_setting("文字搜索时限", &args[1])?;
                 let image = parse_u64_setting("带图搜索时限", &args[2])?;
-                let hedge = parse_u64_setting("备用模型启动时限", &args[3])?;
+                let hedge = parse_u64_setting("慢请求抢跑时限", &args[3])?;
                 let fallback = parse_u64_setting("无搜索兜底时限", &args[4])?;
                 let current = self.runtime.read().await.clone();
                 let mut options = AiRuntimeOptions::from(&current);
@@ -775,7 +785,7 @@ impl AiPlugin {
                     &context.client,
                     &context.message,
                     &format!(
-                        "✅ AI 时限已更新\n文字：{text} 秒\n图片：{image} 秒\n切备用：{hedge} 秒\n兜底：{fallback} 秒"
+                        "✅ AI 时限已更新\n文字：{text} 秒\n图片：{image} 秒\n抢跑：{hedge} 秒\n兜底：{fallback} 秒"
                     ),
                 )
                 .await
@@ -945,7 +955,7 @@ async fn runtime_from_store(defaults: &AiDefaults, store: &Store) -> Result<AiRu
         config.image_search_timeout_seconds = parse_u64_setting("带图搜索时限", &value)?;
     }
     if let Some(value) = store.get_setting(AI_SEARCH_HEDGE_SETTING).await? {
-        config.search_hedge_seconds = parse_u64_setting("备用模型启动时限", &value)?;
+        config.search_hedge_seconds = parse_u64_setting("慢请求抢跑时限", &value)?;
     }
     if let Some(value) = store.get_setting(AI_FALLBACK_TIMEOUT_SETTING).await? {
         config.fallback_timeout_seconds = parse_u64_setting("无搜索兜底时限", &value)?;
@@ -1025,8 +1035,10 @@ fn validate_runtime_config(config: &AiConfig, messages: &MessagesConfig) -> Resu
     if config.image_search_timeout_seconds < config.search_timeout_seconds {
         bail!("带图搜索时限不能短于文字搜索时限");
     }
-    if !(3..config.search_timeout_seconds).contains(&config.search_hedge_seconds) {
-        bail!("备用模型启动时限必须至少 3 秒，并且短于文字搜索总时限");
+    if config.search_hedge_seconds != 0
+        && !(3..config.search_timeout_seconds).contains(&config.search_hedge_seconds)
+    {
+        bail!("慢请求抢跑时限必须为 0，或至少 3 秒且短于文字搜索总时限");
     }
     validate_runtime_message("搜索进度文案", &messages.ai_searching)?;
     validate_runtime_message("思考进度文案", &messages.ai_thinking)?;
@@ -1053,6 +1065,24 @@ fn parse_u64_setting(name: &str, value: &str) -> Result<u64> {
     value
         .parse::<u64>()
         .with_context(|| format!("{name}必须是整数"))
+}
+
+fn display_search_fallback(model: &str) -> &str {
+    if model.trim().is_empty() {
+        "关闭"
+    } else {
+        model
+    }
+}
+
+fn display_search_hedge(seconds: u64, search_fallback_model: &str) -> String {
+    if seconds == 0 {
+        "关闭".to_owned()
+    } else if search_fallback_model.trim().is_empty() {
+        format!("{seconds} 秒后用主模型并发重试")
+    } else {
+        format!("{seconds} 秒后尝试备用模型")
+    }
 }
 
 fn parse_u32_setting(name: &str, value: &str) -> Result<u32> {
@@ -1535,7 +1565,7 @@ struct OpenAiCompatibleProvider {
     api_key: String,
     system_prompt: String,
     primary_model: String,
-    search_fallback_model: String,
+    search_hedge_model: String,
     max_output_tokens: u32,
     api_format: AiApiFormat,
 }
@@ -1556,7 +1586,7 @@ impl OpenAiCompatibleProvider {
             bail!("OpenAI-compatible provider received an unsupported API format");
         }
         validate_model("ai.model", primary_model)?;
-        validate_model("ai.search_fallback_model", search_fallback_model)?;
+        let search_hedge_model = resolve_search_hedge_model(primary_model, search_fallback_model)?;
         validate_api_key(&api_key)?;
         let base_url = normalize_base_url(base_url)?;
         let suffix = match api_format {
@@ -1571,7 +1601,7 @@ impl OpenAiCompatibleProvider {
             api_key,
             system_prompt: config.system_prompt.clone(),
             primary_model: primary_model.to_owned(),
-            search_fallback_model: search_fallback_model.to_owned(),
+            search_hedge_model,
             max_output_tokens: config.max_output_tokens,
             api_format,
         })
@@ -1591,7 +1621,7 @@ impl OpenAiCompatibleProvider {
             );
         }
         let started = Instant::now();
-        if self.primary_model == self.search_fallback_model {
+        if hedge_delay.is_zero() {
             return self
                 .request(&self.primary_model, query, true, images, total_limit)
                 .await
@@ -1608,7 +1638,9 @@ impl OpenAiCompatibleProvider {
                 info!(
                     model = self.primary_model,
                     hedge_after_ms = hedge_delay.as_millis(),
-                    "OpenAI-compatible native search is slow; starting fallback model"
+                    hedge_model = self.search_hedge_model,
+                    same_model = self.primary_model == self.search_hedge_model,
+                    "OpenAI-compatible native search is slow; starting hedged request"
                 );
                 None
             }
@@ -1621,11 +1653,11 @@ impl OpenAiCompatibleProvider {
             );
         }
         let mut fallback =
-            Box::pin(self.request(&self.search_fallback_model, query, true, images, remaining));
+            Box::pin(self.request(&self.search_hedge_model, query, true, images, remaining));
 
         if let Some(primary_error) = primary_error {
             return fallback.await.map_err(|fallback_error| {
-                native_search_models_failed(&primary_error, &fallback_error, started.elapsed())
+                native_search_attempts_failed(&primary_error, &fallback_error, started.elapsed())
             });
         }
         tokio::select! {
@@ -1633,7 +1665,7 @@ impl OpenAiCompatibleProvider {
                 Ok(answer) => Ok(answer),
                 Err(primary_error) => match fallback.await {
                     Ok(answer) => Ok(answer),
-                    Err(fallback_error) => Err(native_search_models_failed(
+                    Err(fallback_error) => Err(native_search_attempts_failed(
                         &primary_error,
                         &fallback_error,
                         started.elapsed(),
@@ -1644,7 +1676,7 @@ impl OpenAiCompatibleProvider {
                 Ok(answer) => Ok(answer),
                 Err(fallback_error) => match primary.await {
                     Ok(answer) => Ok(answer),
-                    Err(primary_error) => Err(native_search_models_failed(
+                    Err(primary_error) => Err(native_search_attempts_failed(
                         &primary_error,
                         &fallback_error,
                         started.elapsed(),
@@ -2032,7 +2064,7 @@ struct GeminiProvider {
     api_key: String,
     system_prompt: String,
     primary_model: String,
-    search_fallback_model: String,
+    search_hedge_model: String,
     thinking_level: String,
     max_output_tokens: u32,
 }
@@ -2046,7 +2078,7 @@ impl GeminiProvider {
         api_key: String,
     ) -> Result<Self> {
         validate_model("ai.model", primary_model)?;
-        validate_model("ai.search_fallback_model", search_fallback_model)?;
+        let search_hedge_model = resolve_search_hedge_model(primary_model, search_fallback_model)?;
         validate_api_key(&api_key)?;
         let base_url = normalize_base_url(base_url)?;
         let endpoint = if base_url.ends_with("/v1beta") {
@@ -2060,7 +2092,7 @@ impl GeminiProvider {
             api_key,
             system_prompt: config.system_prompt.clone(),
             primary_model: primary_model.to_owned(),
-            search_fallback_model: search_fallback_model.to_owned(),
+            search_hedge_model,
             thinking_level: config.thinking_level.clone(),
             max_output_tokens: config.max_output_tokens,
         })
@@ -2074,6 +2106,12 @@ impl GeminiProvider {
         hedge_delay: Duration,
     ) -> Result<AiAnswer> {
         let started = Instant::now();
+        if hedge_delay.is_zero() {
+            return self
+                .request(&self.primary_model, query, true, images, total_limit)
+                .await
+                .map_err(anyhow::Error::from);
+        }
         let deadline = started + total_limit;
         let mut primary =
             Box::pin(self.request(&self.primary_model, query, true, images, total_limit));
@@ -2085,7 +2123,9 @@ impl GeminiProvider {
                 info!(
                     model = self.primary_model,
                     hedge_after_ms = hedge_delay.as_millis(),
-                    "Gemini native search is slow; starting fallback search model"
+                    hedge_model = self.search_hedge_model,
+                    same_model = self.primary_model == self.search_hedge_model,
+                    "Gemini native search is slow; starting hedged request"
                 );
                 None
             }
@@ -2099,11 +2139,11 @@ impl GeminiProvider {
             ));
         }
         let mut fallback =
-            Box::pin(self.request(&self.search_fallback_model, query, true, images, remaining));
+            Box::pin(self.request(&self.search_hedge_model, query, true, images, remaining));
 
         if let Some(primary_error) = primary_error {
             return fallback.await.map_err(|fallback_error| {
-                native_search_models_failed(&primary_error, &fallback_error, started.elapsed())
+                native_search_attempts_failed(&primary_error, &fallback_error, started.elapsed())
             });
         }
 
@@ -2112,7 +2152,7 @@ impl GeminiProvider {
                 Ok(answer) => Ok(answer),
                 Err(primary_error) => match fallback.await {
                     Ok(answer) => Ok(answer),
-                    Err(fallback_error) => Err(native_search_models_failed(
+                    Err(fallback_error) => Err(native_search_attempts_failed(
                         &primary_error,
                         &fallback_error,
                         started.elapsed(),
@@ -2123,7 +2163,7 @@ impl GeminiProvider {
                 Ok(answer) => Ok(answer),
                 Err(fallback_error) => match primary.await {
                     Ok(answer) => Ok(answer),
-                    Err(primary_error) => Err(native_search_models_failed(
+                    Err(primary_error) => Err(native_search_attempts_failed(
                         &primary_error,
                         &fallback_error,
                         started.elapsed(),
@@ -2364,13 +2404,23 @@ impl AiProviderBackend for GeminiProvider {
     }
 }
 
-fn native_search_models_failed(
+fn resolve_search_hedge_model(primary_model: &str, search_fallback_model: &str) -> Result<String> {
+    let fallback = search_fallback_model.trim();
+    if fallback.is_empty() {
+        Ok(primary_model.to_owned())
+    } else {
+        validate_model("ai.search_fallback_model", fallback)?;
+        Ok(fallback.to_owned())
+    }
+}
+
+fn native_search_attempts_failed(
     primary: &ProviderError,
     fallback: &ProviderError,
     elapsed: Duration,
 ) -> anyhow::Error {
     anyhow!(
-        "native search failed after {:.1}s; primary: {}; fallback: {}",
+        "native search failed after {:.1}s; primary: {}; hedge: {}",
         elapsed.as_secs_f32(),
         primary,
         fallback
@@ -2523,6 +2573,21 @@ mod tests {
         assert!(normalize_base_url("http://example.com").is_err());
         assert!(normalize_base_url("https://user@example.com").is_err());
         assert!(normalize_base_url("https://example.com?token=secret").is_err());
+    }
+
+    #[test]
+    fn an_empty_search_fallback_reuses_the_primary_model() {
+        assert_eq!(
+            resolve_search_hedge_model("primary-model", "").unwrap(),
+            "primary-model"
+        );
+        assert_eq!(
+            resolve_search_hedge_model("primary-model", " fallback-model ").unwrap(),
+            "fallback-model"
+        );
+        assert_eq!(display_search_fallback(""), "关闭");
+        assert_eq!(display_search_hedge(3, ""), "3 秒后用主模型并发重试");
+        assert_eq!(display_search_hedge(0, "fallback-model"), "关闭");
     }
 
     #[test]

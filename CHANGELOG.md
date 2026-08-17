@@ -19,3 +19,5 @@ User-visible changes to telebot are recorded here.
 
 - Replace the abbreviated setup notes with a complete first-deployment path, explicit session-import
   limitation, AI data-flow boundaries and verified service checks.
+- Use the primary model for slow-search hedging when no fallback model is configured, and allow
+  hedging to be disabled with a zero-second setting.

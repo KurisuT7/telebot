@@ -19,7 +19,7 @@ Telegram. Use only an account you control and follow the
 - Common AI settings, including the endpoint, model, key, prompt, and timeouts, can be changed from
   Saved Messages without rebuilding.
 - Command concurrency is bounded, missed Telegram updates are caught up after short restarts, and a
-  slow native-search request can start a fallback model.
+  slow native-search request can start a parallel retry.
 
 ## Prerequisites
 
@@ -136,7 +136,7 @@ api_format = "openai_chat_completions"
 api_key_env = "TELEBOT_AI_API_KEY"
 base_url = "https://api.example.com/v1"
 model = "example-model"
-search_fallback_model = "example-model"
+search_fallback_model = ""
 default_search = false
 ```
 
@@ -144,16 +144,18 @@ Set `base_url` to the API prefix. Telebot appends `chat/completions` or `respons
 not already end with the selected endpoint. Select `openai_responses` only when the service actually
 implements the Responses API.
 
-For native-search formats, if the primary model has not completed within `search_hedge_seconds`,
-telebot starts `search_fallback_model` and uses the first successful result. Text and image requests
-have separate `search_timeout_seconds` and `image_search_timeout_seconds` budgets.
+For native-search formats, if the first request has not completed within `search_hedge_seconds`,
+telebot starts a second request and uses the first successful result. An empty `search_fallback_model`
+keeps both requests on the primary model; setting it uses that model for the second request. Set
+`search_hedge_seconds` to `0` to disable hedging. Text and image requests have separate
+`search_timeout_seconds` and `image_search_timeout_seconds` budgets.
 
 ## Changing AI settings at runtime
 
 The following commands are accepted only in Saved Messages and take effect immediately:
 
 - `.ai config provider <api_format> <name> <base_url>`
-- `.ai config model <primary> [search_fallback]`
+- `.ai config model <primary> [search_fallback|off]`
 - `.ai config key <key>` / `.ai config clear-key`
 - `.ai config prompt <system_prompt>`
 - `.ai config thinking <minimal|low|medium|high>`

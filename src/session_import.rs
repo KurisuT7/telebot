@@ -9,7 +9,7 @@ use grammers_session::storages::SqliteSession;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-struct TeleboxConfig {
+struct GramJsConfig {
     session: String,
 }
 
@@ -29,8 +29,8 @@ pub async fn import_gramjs_config(source: &Path, destination: &Path) -> Result<(
     }
     let raw = fs::read_to_string(source)
         .with_context(|| format!("failed to read {}", source.display()))?;
-    let config: TeleboxConfig = serde_json::from_str(&raw)
-        .with_context(|| format!("invalid TeleBox config {}", source.display()))?;
+    let config: GramJsConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid GramJS session JSON {}", source.display()))?;
     let imported = parse_gramjs_session(config.session.trim())?;
 
     if let Some(parent) = destination.parent() {

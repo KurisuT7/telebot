@@ -1,5 +1,7 @@
 # Security policy
 
+[简体中文](SECURITY.zh-CN.md) | English
+
 Do not report credentials, private messages, session data or exploitable details in a public issue.
 Use GitHub's [private vulnerability reporting](https://github.com/KurisuT7/telebot/security/advisories/new)
 for security reports. If that form is unavailable, open a public issue containing no vulnerability

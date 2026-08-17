@@ -272,7 +272,7 @@ impl Config {
     }
 
     pub fn load_secrets(&self) -> Result<Secrets> {
-        let telegram_api_hash = required_env(&self.telegram.api_hash_env)?;
+        let telegram_api_hash = self.load_telegram_api_hash()?;
         let ai_api_key = if self.ai.enabled {
             Some(required_env(&self.ai.api_key_env)?)
         } else {
@@ -282,6 +282,10 @@ impl Config {
             telegram_api_hash,
             ai_api_key,
         })
+    }
+
+    pub fn load_telegram_api_hash(&self) -> Result<String> {
+        required_env(&self.telegram.api_hash_env)
     }
 }
 

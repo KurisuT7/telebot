@@ -6,10 +6,16 @@ User-visible changes to telebot are recorded here.
 
 ### Added
 
+- Add interactive Telegram user authorization with hidden 2FA password input; existing GramJS
+  session JSON import remains available as an optional migration path.
 - Add explicit `gemini_interactions`, `openai_chat_completions` and `openai_responses` AI formats.
 - Add standard OpenAI-compatible text, image and Responses web-search request handling without
   gateway-specific branches.
 - Add bounded response parsing, transient retry handling and citation extraction for the new API
   formats.
-- Add a Simplified Chinese README with the same commands, configuration and operating boundaries as
-  the English documentation.
+- Add Simplified Chinese README, operations, contribution and security guides.
+
+### Changed
+
+- Replace the abbreviated setup notes with a complete first-deployment path, explicit session-import
+  limitation, AI data-flow boundaries and verified service checks.

@@ -1,5 +1,7 @@
 # Contributing
 
+[简体中文](CONTRIBUTING.zh-CN.md) | English
+
 Contributions should keep telebot small, bounded and usable without the original maintainer's
 accounts or infrastructure.
 

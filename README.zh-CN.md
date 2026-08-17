@@ -2,51 +2,123 @@
 
 简体中文 | [English](README.md)
 
-`telebot` 是一个独立的 Rust Telegram 用户客户端。项目刻意保持精简：运行时、命令路由、
-状态存储、AI 服务和引用图片功能相互分离，因此添加新命令时不需要修改 Telegram 连接代码。
+`telebot` 以你的 Telegram 账号登录，在聊天中响应 `.ai` 和 `.q` 命令。它可以调用 AI
+回答问题、联网搜索或分析图片，也可以把消息做成语录贴纸和图片。
 
-目前提供以下命令：
+这是 Telegram 用户客户端，不是 Bot API 机器人。它只处理当前账号本人发出的命令，不会把
+其他人的消息当成指令。本项目与 Telegram 没有隶属或授权关系；请只使用自己控制的账号，并遵守
+[Telegram API 使用条款](https://core.telegram.org/api/terms)。
 
-- `.ai <问题>`：默认使用原生联网搜索。
-- 回复文字、选中的引用、图片或静态贴纸后发送 `.ai`，将回复内容用于本次请求。
-- `.ai chat <问题>` / `.ai search <问题>`：强制使用普通回答或原生联网搜索。
-- `.ai config`：查看当前 AI 服务和 API 格式，不显示 Key 内容。
-- `.ai config provider <api_format> <name> <base_url>`：修改线协议、显示名称和接口地址。
-- `.ai config key <key>` / `.ai config model <primary> [search_fallback]`：修改凭据或模型。
-- `.ai config prompt|thinking|search|timeout|tokens|collapse|message`：无需重新构建，立即修改常用 AI 行为和进度文案。
-- `.ai config reload`：重新读取服务器 AI 和消息 TOML，同时保留 SQLite 动态覆盖；`.ai config reset` 清除这些覆盖。
-- `.ai context <0-20|on|off>`：设置每个聊天的滚动上下文；默认关闭。
-- `.ai reset|status|help`：清除当前聊天上下文、查看配置或显示详细使用与安全说明。
-- `.q [1-5]`：使用被回复消息及后续消息生成引用贴纸。
-- `.q r [1-5]`、`.q image [1-5]`、`.q stories [1-5]`：包含回复或选择 PNG 布局。
-- `.q history` / `.q history <id>`：列出最近存档的引用或按 ID 重新发送。
-- `.q s`：把被回复的贴纸或图片添加到配置的贴纸包。
-- `.q config`：查看引用图片设置；使用 `history on|off` 和 `history limit <1-500>` 控制存档。
+## 主要功能
 
-所有命令都接受配置中的任意前缀。默认部署配置为 `.`、`。`、`,`、`，`、`$`、`!` 和 `！`。
+- `.ai`：普通问答、联网搜索、图片理解和可选的多轮上下文。
+- `.q`：把一至五条消息生成 WebP 贴纸或 PNG 图片，并可保存到贴纸包。
+- 支持 Gemini Interactions、OpenAI Chat Completions 和 OpenAI Responses 三种 API 格式。
+- 模型、接口地址、Key、超时和提示词等常用设置可以直接在 Telegram 收藏夹中修改。
+- 同时执行的命令数量有限制；短暂重启期间收到的命令会在恢复后继续处理；联网搜索等主模型过久时会自动尝试备用模型。
 
-Telegram 可能把同一账号写出的命令同步为 `outgoing=false`，收藏夹中尤其如此。只有消息为
-outgoing、发送者为已授权账号或会话为收藏夹时，路由器才接受命令；其他用户发来的命令会被忽略。
-默认部署启用更新追赶，因此短暂重启期间写出的命令不会丢失。
+## 开始前
 
-AI 回答使用 Telegram 原生富文本实体。Markdown 标题、强调、代码、列表和链接会被保留；
-`Q:` 和 `A:` 默认都使用可展开引用。过长回答会在不破坏 UTF-16 实体偏移的位置拆分。
-服务商、模型和上下文设置保存在本地应用数据库中。`.ai config key` 只能在收藏夹中使用：
-命令会立即隐藏，Key 不会回显，并保存在仅所有者可访问的本地数据库中；没有动态 Key 时，
-程序继续从服务器环境变量读取凭据。
+当前部署脚本面向带 systemd 的 Linux 服务器。首次部署需要：
 
-AI 适配器支持 `gemini_interactions`、`openai_chat_completions` 和 `openai_responses`。
-OpenAI 兼容服务只使用所选标准线协议，代码中没有针对特定网关的分支。`base_url` 应填写
-API 前缀，例如 `https://api.example.com/v1`；如果地址末尾还没有对应端点，telebot 会追加
-`chat/completions` 或 `responses`。
+- Docker、Docker Compose、Git 和 curl；
+- 自己申请的 Telegram `api_id` 和 `api_hash`，申请方法见
+  [Telegram 官方文档](https://core.telegram.org/api/obtaining_api_id)；
+- 一个使用 Gemini Interactions、OpenAI Chat Completions 或 OpenAI Responses 格式的 AI 接口，
+  以及对应的模型和 API Key。
 
-Gemini Interactions 和 OpenAI Responses 支持原生联网搜索。OpenAI Chat Completions 没有
-统一的标准搜索工具，因此强制搜索失败后会返回带有明确提示的非联网回答。原生搜索会在主模型
-变慢后启动备用模型并采用先完成的结果，同时对 HTTPS 引用去重后渲染为 Telegram 链接。带图搜索使用单独且更长的
-总超时，不会改变纯文字请求的延迟预算。
+以下命令都在仓库根目录执行。
 
-接入通用 Chat Completions 接口时，修改 `config.toml` 中的以下字段，并在仓库外提供对应的
-环境变量：
+## 首次部署
+
+先构建程序：
+
+```sh
+sudo scripts/server/build-container.sh
+```
+
+创建运行账号和目录，再安装示例配置：
+
+```sh
+sudo useradd --system --home-dir /var/lib/telebot --shell "$(command -v nologin)" telebot
+sudo install -d -m 0755 /etc/telebot
+sudo install -d -o telebot -g telebot -m 0700 /var/lib/telebot
+sudo install -m 0644 config.example.toml /etc/telebot/config.toml
+sudo install -m 0600 deploy/telebot.env.example /etc/telebot/telebot.env
+```
+
+在 `/etc/telebot/config.toml` 中填写 `telegram.api_id` 和 AI 接口信息。在
+`/etc/telebot/telebot.env` 中填写 `TELEBOT_TELEGRAM_API_HASH` 以及配置文件中
+`ai.api_key_env` 指向的变量。不要把这两个文件、Telegram 会话或数据库提交到 Git。
+
+授权 Telegram 账号：
+
+```sh
+sudo scripts/server/login.sh
+```
+
+按提示输入带国家代码的手机号和 Telegram 验证码。账号启用了两步验证时，还会要求输入密码。
+验证码和密码都不会显示在终端中。telebot 只登录已有账号，不能注册新账号。
+
+最后安装本地语录渲染服务并部署 telebot：
+
+```sh
+sudo scripts/server/install-quote-api.sh
+sudo scripts/server/deploy.sh first
+sudo systemctl enable telebot.service
+sudo scripts/server/status.sh
+```
+
+部署脚本会先检查配置，再切换到新版本。如果启动失败或 35 秒内没有出现
+`telebot is ready`，脚本会切回上一个版本。完整的更新、检查、备份和回滚步骤见
+[运维文档](docs/operations.zh-CN.md)。
+
+## Telegram 命令
+
+### AI
+
+- `.ai <问题>`：按当前默认模式回答；示例配置默认联网。
+- `.ai chat <问题>`：不联网，直接使用模型回答。
+- `.ai search <问题>`：强制使用当前 API 格式支持的联网搜索。
+- 回复文字、选中的一段文字、图片或静态贴纸后发送 `.ai`，可把它作为本次请求的输入。
+- `.ai context on|off` 或 `.ai context <1-20>`：设置当前聊天保留多少轮上下文。
+- `.ai reset`：清除当前聊天已经保存的上下文。
+- `.ai status` / `.ai config`：查看当前生效的设置；不会显示 Key。
+- `.ai help`：在 Telegram 中查看完整命令说明。
+
+AI 回答会保留标题、强调、代码、列表和链接等格式。长消息会自动拆分，链接和富文本不会因此
+错位。
+
+### 语录图片和贴纸
+
+- 回复一条消息后发送 `.q [1-5]`：从该消息开始，生成包含一至五条消息的 WebP 贴纸。
+- `.q r [1-5]`：同时显示消息引用的内容。
+- `.q image [1-5]`：生成 PNG 图片。
+- `.q stories [1-5]`：生成适合 Stories 的 PNG 图片。
+- `.q s`：把回复的图片或贴纸保存到配置的贴纸包。
+- `.q history` / `.q history <ID>`：查看或重新发送已存档的语录。
+- `.q config`：查看贴纸包和存档设置；`history on|off` 和 `history limit <1-500>` 用于管理存档。
+
+语录存档默认关闭，开启后只保存新生成的内容。程序会同时按条数和磁盘占用淘汰最旧记录。
+
+语录图片在自己的服务器上生成，不会发送到公共渲染接口。quote-api 的安装和更新方法见
+[运维文档](docs/operations.zh-CN.md)。
+
+默认命令前缀为 `.`、`。`、`,`、`，`、`$`、`!` 和 `！`，可在配置文件中修改。命令可以在
+普通聊天或收藏夹中使用；telebot 只执行当前账号本人发出的命令。
+
+## AI 接口
+
+`ai.api_format` 决定实际发送的请求格式，`ai.provider` 只是显示名称。telebot 不会根据服务商、
+模型名或 URL 猜测协议，也没有针对某个网关的专用分支。
+
+| `api_format` | 联网搜索 | 说明 |
+| --- | --- | --- |
+| `gemini_interactions` | 支持 | 使用 Gemini Interactions 的原生搜索 |
+| `openai_responses` | 支持 | 使用 Responses API 的 `web_search` 工具 |
+| `openai_chat_completions` | 不支持 | 该格式没有统一的搜索工具；`.ai search` 会改为普通回答，并注明没有联网 |
+
+接入通用 Chat Completions 接口时，可按下面修改 `/etc/telebot/config.toml`：
 
 ```toml
 [ai]
@@ -59,51 +131,56 @@ search_fallback_model = "example-model"
 default_search = false
 ```
 
-只有接口确实实现 Responses 协议时才使用 `openai_responses`。该格式会启用标准 Responses
-`web_search` 工具，并要求配置搜索备用模型。Telebot 不会根据服务商名称、模型名称或 URL
-自动猜测协议。
+`base_url` 填 API 前缀即可；若末尾不是完整端点，telebot 会按所选格式追加
+`chat/completions` 或 `responses`。只有服务端确实实现 Responses API 时才选择
+`openai_responses`。
 
-经常调整的 AI 值作为运行时设置保存在 SQLite 中。服务商、BaseURL、Key、模型、系统提示词、
-思考等级、默认搜索、超时、最大输出、引用折叠和 AI 进度文案都可以在收藏夹中修改并立即生效。
-TOML 的 `[messages]` 部分提供服务器默认值。并发上限和插件启停仍然只在启动时读取。
+对于支持联网搜索的格式，如果主模型在 `search_hedge_seconds` 内没有完成，telebot 会同时
+尝试 `search_fallback_model`，并采用先成功的结果。带图请求有单独的
+`image_search_timeout_seconds`，不会拉长纯文字请求的等待上限。
 
-## 设计
+## 运行中修改 AI 设置
 
-- `src/main.rs`：进程生命周期、Telegram 更新流和有并发上限的命令工作器。
-- `src/plugin.rs`：精简的插件 trait 和命令路由；后续功能不需要修改连接循环。
-- `src/plugins/ai.rs`：与服务商名称无关的运行时设置、Gemini 与 OpenAI 兼容适配器、有限上下文和原生搜索回退。
-- `src/plugins/quote.rs`：引用图片生成、有限媒体存档和 Telegram 贴纸包操作。
-- `src/telegram.rs`：Telegram 原生 Markdown 格式、可展开问答引用和安全消息拆分。
-- `src/store.rs`：异步 SQLite 设置、有限 AI 上下文和引用图片存档。
-- `src/session_import.rs`：一次性、离线的 GramJS StringSession 迁移。
+以下命令只能在 Telegram 收藏夹中使用，修改后立即生效：
 
-引用图片使用固定到已审查提交的官方 `LyoSU/quote-api` 源码。它与 telebot 一起自托管，
-只监听 `127.0.0.1:3210`，并以无特权、只读容器运行，同时包含 Noto CJK 字体。这样不依赖
-不稳定的公共渲染服务，也能正确显示中文字符。
+- `.ai config provider <API格式> <名称> <BaseURL>`
+- `.ai config model <主模型> [搜索备用模型]`
+- `.ai config key <Key>` / `.ai config clear-key`
+- `.ai config prompt <系统提示词>`
+- `.ai config thinking <minimal|low|medium|high>`
+- `.ai config search <on|off>`
+- `.ai config timeout <文字秒> <图片秒> <切备用秒> <兜底秒>`
+- `.ai config tokens <1-65536>`
+- `.ai config collapse <on|off>`
+- `.ai config message searching|thinking <文案>`
+- `.ai config reload` / `.ai config reset`
 
-## 命令行
+这些设置保存在 `/var/lib/telebot/telebot.db`。`.ai config key` 会先隐藏含 Key 的命令，
+不会在回复中显示 Key；`clear-key` 会恢复使用服务器环境变量。AI 并发数和插件开关仍需修改
+TOML 并重启服务。
 
-```text
-telebot validate --config /etc/telebot/config.toml
-telebot import-gramjs-session --from /path/to/TeleBox/config.json --to /var/lib/telebot/telegram.session
-telebot check-session --config /etc/telebot/config.toml
-telebot check-ai --config /etc/telebot/config.toml
-telebot check-quote --config /etc/telebot/config.toml
-telebot check-telegram-image --config /etc/telebot/config.toml --image /path/to/test-image.png
-telebot serve --config /etc/telebot/config.toml
-```
+## 数据会发送到哪里
 
-会打开 Telegram 会话的命令不能与 `telebot.service` 同时运行。在 systemd 主机上，请使用
-`scripts/server/check-telegram.sh session|format|plugins|all`，或使用
-`scripts/server/check-telegram.sh image /path/to/test-image.png`。脚本会先停止服务，执行检查，
-随后确认服务重新进入就绪状态。
+- 消息的读取、编辑、发送和贴纸包操作仍通过 Telegram 完成。
+- 登录时，手机号、验证码和可选的 2FA 密码只发送给 Telegram；telebot 保存登录后的 Session，
+  不把验证码或密码写入配置和数据库。
+- AI 服务会收到本次问题、回复的文字或图片，以及已开启的聊天上下文。
+- 语录渲染默认只经过本机的 quote-api。
+- Telegram 会话、动态 AI 设置、聊天上下文和语录存档保存在 `/var/lib/telebot`。
 
-构建使用固定的 Rust 1.90 工具链、已提交的 `Cargo.lock` 和可复用的容器缓存。部署、健康检查、
-回滚和升级说明位于 [docs/operations.md](docs/operations.md)。
+请把 `/etc/telebot/telebot.env` 和 `/var/lib/telebot` 限制为服务器管理员及 telebot 运行账号可读。
 
-## 项目规则
+## 当前限制
 
-- 运维：[docs/operations.md](docs/operations.md)
-- 贡献：[CONTRIBUTING.md](CONTRIBUTING.md)
-- 安全报告：[SECURITY.md](SECURITY.md)
-- 许可：[MIT](LICENSE)
+- 仓库提供的部署和运维脚本只面向 Linux、systemd 和 Docker。
+- 登录支持手机号、验证码和 2FA 密码，暂不支持二维码登录或注册新账号。
+- Chat Completions 没有统一的联网搜索协议。
+- AI 图片输入只接受照片和静态贴纸；语录渲染需要单独运行 quote-api。
+
+## 项目文档
+
+- [运维与升级](docs/operations.zh-CN.md)
+- [参与开发](CONTRIBUTING.zh-CN.md)
+- [报告安全问题](SECURITY.zh-CN.md)
+- [更新记录](CHANGELOG.md)
+- [MIT License](LICENSE)

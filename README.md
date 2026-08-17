@@ -1,5 +1,7 @@
 # telebot
 
+[简体中文](README.zh-CN.md) | English
+
 `telebot` is an independent Rust Telegram user client. It is intentionally small: the runtime,
 command router, state store, AI provider and quote feature are separate modules, so new commands
 can be added without modifying Telegram connection code.
@@ -106,3 +108,10 @@ requested checks and verifies that the service becomes ready again.
 
 Builds use the pinned Rust 1.90 toolchain, a committed `Cargo.lock` and a reusable container cache.
 Deployment, health checks, rollback and upgrade notes are in `docs/operations.md`.
+
+## Project policy
+
+- Operations: [docs/operations.md](docs/operations.md)
+- Contributions: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Security reports: [SECURITY.md](SECURITY.md)
+- License: [MIT](LICENSE)

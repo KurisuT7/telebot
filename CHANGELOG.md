@@ -11,3 +11,5 @@ User-visible changes to telebot are recorded here.
   gateway-specific branches.
 - Add bounded response parsing, transient retry handling and citation extraction for the new API
   formats.
+- Add a Simplified Chinese README with the same commands, configuration and operating boundaries as
+  the English documentation.

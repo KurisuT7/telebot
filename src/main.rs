@@ -3,6 +3,7 @@ mod config;
 mod plugin;
 mod plugins;
 mod session_import;
+mod session_login;
 mod store;
 mod telegram;
 
@@ -56,6 +57,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Authorize a Telegram user session using a phone number and login code.
+    Login {
+        #[arg(long, default_value = "/etc/telebot/config.toml")]
+        config: PathBuf,
+    },
     Serve {
         #[arg(long, default_value = "/etc/telebot/config.toml")]
         config: PathBuf,
@@ -110,6 +116,7 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
+        Commands::Login { config } => session_login::login(&config).await,
         Commands::Serve { config } => serve(&config).await,
         Commands::Validate { config } => {
             let config = Config::load(&config)?;

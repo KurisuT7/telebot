@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -43,6 +44,8 @@ pub struct AiConfig {
     pub enabled: bool,
     #[serde(default = "default_ai_provider")]
     pub provider: String,
+    #[serde(default = "default_ai_api_format")]
+    pub api_format: AiApiFormat,
     pub api_key_env: String,
     #[serde(default = "default_gemini_base_url")]
     pub base_url: String,
@@ -76,6 +79,39 @@ pub struct AiConfig {
     pub search_hedge_seconds: u64,
     #[serde(default = "default_fallback_timeout")]
     pub fallback_timeout_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiApiFormat {
+    GeminiInteractions,
+    OpenaiChatCompletions,
+    OpenaiResponses,
+}
+
+impl AiApiFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GeminiInteractions => "gemini_interactions",
+            Self::OpenaiChatCompletions => "openai_chat_completions",
+            Self::OpenaiResponses => "openai_responses",
+        }
+    }
+}
+
+impl FromStr for AiApiFormat {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "gemini_interactions" => Ok(Self::GeminiInteractions),
+            "openai_chat_completions" => Ok(Self::OpenaiChatCompletions),
+            "openai_responses" => Ok(Self::OpenaiResponses),
+            _ => bail!(
+                "AI API format must be gemini_interactions, openai_chat_completions, or openai_responses"
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -153,14 +189,23 @@ impl Config {
             bail!("telegram.max_parallel_commands must be at least 1");
         }
         if self.ai.enabled {
-            if self.ai.provider != "gemini" {
-                bail!("only ai.provider=\"gemini\" is supported in this release");
+            if self.ai.provider.trim().is_empty()
+                || self.ai.provider.len() > 32
+                || !self
+                    .ai
+                    .provider
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            {
+                bail!(
+                    "ai.provider must contain only letters, numbers, dots, hyphens, or underscores and be at most 32 characters"
+                );
             }
             if self.ai.api_key_env.trim().is_empty()
+                || self.ai.base_url.trim().is_empty()
                 || self.ai.model.trim().is_empty()
-                || self.ai.search_fallback_model.trim().is_empty()
             {
-                bail!("AI key and model settings must not be empty");
+                bail!("AI key, base URL, and model settings must not be empty");
             }
             if !matches!(
                 self.ai.thinking_level.as_str(),
@@ -186,8 +231,10 @@ impl Config {
             if self.ai.image_search_timeout_seconds < self.ai.search_timeout_seconds {
                 bail!("ai.image_search_timeout_seconds must be at least search timeout");
             }
-            if !(3..self.ai.search_timeout_seconds).contains(&self.ai.search_hedge_seconds) {
-                bail!("ai.search_hedge_seconds must be at least 3 and below search timeout");
+            if self.ai.search_hedge_seconds != 0
+                && !(3..self.ai.search_timeout_seconds).contains(&self.ai.search_hedge_seconds)
+            {
+                bail!("ai.search_hedge_seconds must be 0, or at least 3 and below search timeout");
             }
         }
         validate_progress_message("messages.ai_searching", &self.messages.ai_searching)?;
@@ -218,7 +265,7 @@ impl Config {
     }
 
     pub fn load_secrets(&self) -> Result<Secrets> {
-        let telegram_api_hash = required_env(&self.telegram.api_hash_env)?;
+        let telegram_api_hash = self.load_telegram_api_hash()?;
         let ai_api_key = if self.ai.enabled {
             Some(required_env(&self.ai.api_key_env)?)
         } else {
@@ -228,6 +275,10 @@ impl Config {
             telegram_api_hash,
             ai_api_key,
         })
+    }
+
+    pub fn load_telegram_api_hash(&self) -> Result<String> {
+        required_env(&self.telegram.api_hash_env)
     }
 }
 
@@ -255,11 +306,14 @@ fn default_parallel_commands() -> usize {
 fn default_ai_provider() -> String {
     "gemini".to_owned()
 }
+fn default_ai_api_format() -> AiApiFormat {
+    AiApiFormat::GeminiInteractions
+}
 fn default_gemini_base_url() -> String {
     "https://generativelanguage.googleapis.com".to_owned()
 }
 fn default_search_fallback_model() -> String {
-    "gemini-3.1-flash-lite".to_owned()
+    String::new()
 }
 fn default_thinking_level() -> String {
     "minimal".to_owned()
@@ -294,7 +348,7 @@ fn default_image_search_timeout() -> u64 {
     30
 }
 fn default_search_hedge() -> u64 {
-    10
+    3
 }
 fn default_fallback_timeout() -> u64 {
     10
@@ -333,6 +387,51 @@ mod tests {
     #[test]
     fn image_search_default_is_longer_than_text_search() {
         assert!(default_image_search_timeout() > default_search_timeout());
+    }
+
+    #[test]
+    fn api_formats_use_explicit_stable_names() {
+        assert_eq!(
+            "openai_chat_completions".parse::<AiApiFormat>().unwrap(),
+            AiApiFormat::OpenaiChatCompletions
+        );
+        assert_eq!(
+            "openai_responses".parse::<AiApiFormat>().unwrap(),
+            AiApiFormat::OpenaiResponses
+        );
+        assert!("openrouter".parse::<AiApiFormat>().is_err());
+    }
+
+    #[test]
+    fn openai_compatible_config_does_not_require_a_named_gateway() {
+        let raw = include_str!("../config.example.toml")
+            .replace("api_id = 0", "api_id = 1")
+            .replace("provider = \"gemini\"", "provider = \"generic-oai\"")
+            .replace(
+                "api_format = \"gemini_interactions\"",
+                "api_format = \"openai_chat_completions\"",
+            )
+            .replace(
+                "base_url = \"https://generativelanguage.googleapis.com\"",
+                "base_url = \"https://api.example.com/v1\"",
+            )
+            .replace("default_search = true", "default_search = false");
+        let parsed: Config = toml::from_str(&raw).unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(parsed.ai.provider, "generic-oai");
+        assert_eq!(parsed.ai.api_format, AiApiFormat::OpenaiChatCompletions);
+    }
+
+    #[test]
+    fn native_search_can_use_only_the_primary_model() {
+        let raw = include_str!("../config.example.toml").replace("api_id = 0", "api_id = 1");
+        let mut parsed: Config = toml::from_str(&raw).unwrap();
+        parsed.validate().unwrap();
+        assert!(parsed.ai.search_fallback_model.is_empty());
+        assert_eq!(parsed.ai.search_hedge_seconds, 3);
+
+        parsed.ai.search_hedge_seconds = 0;
+        parsed.validate().unwrap();
     }
 
     #[test]

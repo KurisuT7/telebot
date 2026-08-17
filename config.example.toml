@@ -12,10 +12,12 @@ path = "/var/lib/telebot/telebot.db"
 [ai]
 enabled = true
 provider = "gemini"
+api_format = "gemini_interactions"
 api_key_env = "TELEBOT_GEMINI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com"
 model = "gemini-3.7-flash"
-search_fallback_model = "gemini-3.1-flash-lite"
+# 留空表示抢跑重试仍使用主模型；如需备用模型，可在这里填写模型名。
+search_fallback_model = ""
 thinking_level = "low"
 default_search = true
 system_prompt = "请使用中文准确、简洁地回答。使用联网搜索时优先采用可靠来源，并明确区分事实与推断。"
@@ -29,7 +31,8 @@ max_concurrent = 3
 search_timeout_seconds = 20
 # 带图联网通常更慢；仅图片请求使用这个总时限，纯文字仍使用上面的 20 秒。
 image_search_timeout_seconds = 30
-search_hedge_seconds = 10
+# 搜索超过 3 秒未完成时并发发起一次重试；设为 0 可关闭。
+search_hedge_seconds = 3
 fallback_timeout_seconds = 10
 
 [messages]

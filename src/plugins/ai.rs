@@ -10,13 +10,14 @@ use base64::Engine;
 use grammers_client::Client;
 use grammers_client::media::{Media, Photo, PhotoSize};
 use grammers_client::message::Message;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{StatusCode, Url};
 use serde_json::{Value, json};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
-use crate::config::{AiConfig, Config, MessagesConfig};
+use crate::config::{AiApiFormat, AiConfig, Config, MessagesConfig};
 use crate::plugin::{CommandContext, Plugin};
 use crate::store::{AiHistoryEntry, Store};
 use crate::telegram::{
@@ -33,6 +34,7 @@ const MAX_HISTORY_TOTAL_CHARS: usize = 24_000;
 const DEFAULT_CONTEXT_TURNS: usize = 6;
 const AI_SETTING_PREFIX: &str = "ai.runtime.";
 const AI_PROVIDER_SETTING: &str = "ai.runtime.provider";
+const AI_API_FORMAT_SETTING: &str = "ai.runtime.api_format";
 const AI_BASE_URL_SETTING: &str = "ai.runtime.base_url";
 const AI_KEY_SETTING: &str = "ai.runtime.api_key";
 const AI_MODEL_SETTING: &str = "ai.runtime.model";
@@ -75,15 +77,15 @@ struct AiImage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct GeminiSource {
+struct AiSource {
     title: String,
     url: String,
 }
 
 #[derive(Debug)]
-struct GeminiAnswer {
+struct AiAnswer {
     text: String,
-    sources: Vec<GeminiSource>,
+    sources: Vec<AiSource>,
     model: String,
     search_calls: usize,
 }
@@ -91,6 +93,7 @@ struct GeminiAnswer {
 #[derive(Clone)]
 struct AiRuntimeOptions {
     provider_name: String,
+    api_format: AiApiFormat,
     base_url: String,
     api_key: String,
     primary_model: String,
@@ -104,6 +107,7 @@ struct AiRuntimeOptions {
 #[derive(Clone)]
 struct AiRuntime {
     provider_name: String,
+    api_format: AiApiFormat,
     base_url: String,
     api_key: String,
     primary_model: String,
@@ -112,13 +116,14 @@ struct AiRuntime {
     key_overridden: bool,
     config: AiConfig,
     messages: MessagesConfig,
-    provider: GeminiProvider,
+    provider: Arc<dyn AiProviderBackend>,
 }
 
 impl From<&AiRuntime> for AiRuntimeOptions {
     fn from(runtime: &AiRuntime) -> Self {
         Self {
             provider_name: runtime.provider_name.clone(),
+            api_format: runtime.api_format,
             base_url: runtime.base_url.clone(),
             api_key: runtime.api_key.clone(),
             primary_model: runtime.primary_model.clone(),
@@ -135,6 +140,7 @@ impl AiRuntime {
     fn build(options: AiRuntimeOptions) -> Result<Self> {
         let AiRuntimeOptions {
             provider_name,
+            api_format,
             base_url,
             api_key,
             primary_model,
@@ -148,12 +154,20 @@ impl AiRuntime {
         let base_url = normalize_base_url(&base_url)?;
         validate_api_key(&api_key)?;
         validate_model("主模型", &primary_model)?;
-        validate_model("搜索备用模型", &search_fallback_model)?;
+        let search_fallback_model = if search_fallback_model.trim().is_empty()
+            && api_format == AiApiFormat::OpenaiChatCompletions
+        {
+            primary_model.clone()
+        } else {
+            validate_model("搜索备用模型", &search_fallback_model)?;
+            search_fallback_model
+        };
         if context_turns > 20 {
             bail!("上下文轮数必须在 0 到 20 之间");
         }
         validate_runtime_config(&config, &messages)?;
-        let provider = GeminiProvider::new_runtime(
+        let provider = build_provider(
+            api_format,
             &config,
             &base_url,
             &primary_model,
@@ -162,6 +176,7 @@ impl AiRuntime {
         )?;
         Ok(Self {
             provider_name,
+            api_format,
             base_url,
             api_key,
             primary_model,
@@ -187,22 +202,53 @@ pub async fn check_provider(config: &AiConfig, api_key: String) -> Result<()> {
     if !config.enabled {
         bail!("AI plugin is disabled");
     }
-    let provider = GeminiProvider::new(config, api_key)?;
+    let provider = build_provider(
+        config.api_format,
+        config,
+        &config.base_url,
+        &config.model,
+        &config.search_fallback_model,
+        api_key,
+    )?;
     let started = Instant::now();
-    let answer = provider
-        .generate_search_hedged(
-            "Windows 11 的 ms-cxh:localonly 命令有什么作用？请用一句中文回答。",
-            &[],
-            Duration::from_secs(config.search_timeout_seconds),
-            Duration::from_secs(config.search_hedge_seconds),
+    let query = "Windows 11 的 ms-cxh:localonly 命令有什么作用？请用一句中文回答。";
+    let (answer, searched) = if provider.supports_native_search() {
+        (
+            provider
+                .generate_search_hedged(
+                    query,
+                    &[],
+                    Duration::from_secs(config.search_timeout_seconds),
+                    Duration::from_secs(config.search_hedge_seconds),
+                )
+                .await?,
+            true,
         )
-        .await?;
+    } else {
+        (
+            AiAnswer {
+                text: provider
+                    .generate_chat_with_timeout(
+                        query,
+                        &[],
+                        Duration::from_secs(config.fallback_timeout_seconds),
+                    )
+                    .await?,
+                sources: Vec::new(),
+                model: config.model.clone(),
+                search_calls: 0,
+            },
+            false,
+        )
+    };
     if answer.text.trim().is_empty() {
         bail!("AI provider returned an empty response");
     }
     println!(
-        "AI native search check passed in {} ms (model={}, calls={}, sources={}, answer={} chars)",
+        "AI check passed in {} ms (format={}, searched={}, model={}, calls={}, sources={}, answer={} chars)",
         started.elapsed().as_millis(),
+        config.api_format.as_str(),
+        searched,
         answer.model,
         answer.search_calls,
         answer.sources.len(),
@@ -352,13 +398,13 @@ impl AiPlugin {
                     model = answer.model,
                     search_calls = answer.search_calls,
                     sources = answer.sources.len(),
-                    "Gemini native search completed"
+                    "AI native search completed"
                 );
                 append_sources(&mut answer.text, &answer.sources);
                 Ok((answer.text, true))
             }
             Err(search_error) => {
-                warn!(error = %search_error, scope, "Gemini native search models failed; using non-search fallback");
+                warn!(error = %search_error, scope, "AI native search failed; using non-search fallback");
                 let fallback = runtime
                     .provider
                     .generate_chat_with_timeout(
@@ -383,8 +429,9 @@ impl AiPlugin {
             format!("开启（{} 轮）", runtime.context_turns)
         };
         format!(
-            "🤖 **telebot AI**\n\n- 服务商：`{}`（Gemini 兼容）\n- BaseURL：`{}`\n- Key：**{}**\n- 主模型：`{}`\n- 原生搜索备用模型：`{}`\n- 原生搜索：`Google Search / Interactions API`\n- 思考等级：`{}`\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**{}**\n- 回复消息：作为本次请求上下文\n- Q/A 引用折叠：{}\n- 纯文字搜索总时限：{} 秒\n- 带图搜索总时限：{} 秒\n- 慢请求切备用模型：{} 秒\n- 无搜索兜底时限：{} 秒\n- 最大输出：{} Token\n- 系统提示词：{} 字\n- 搜索进度：{}\n- 思考进度：{}\n- 并发上限：{}（修改后需重启）",
+            "🤖 **telebot AI**\n\n- 服务商：`{}`\n- API 格式：`{}`\n- BaseURL：`{}`\n- Key：**{}**\n- 主模型：`{}`\n- 搜索备用模型：`{}`\n- 原生搜索：`{}`\n- 思考等级：`{}`（仅 Gemini Interactions 使用）\n- 裸命令默认搜索：**{}**\n- 自动记忆上下文：**{}**\n- 回复消息：作为本次请求上下文\n- Q/A 引用折叠：{}\n- 纯文字搜索总时限：{} 秒\n- 带图搜索总时限：{} 秒\n- 慢请求切备用模型：{} 秒\n- 无搜索兜底时限：{} 秒\n- 最大输出：{} Token\n- 系统提示词：{} 字\n- 搜索进度：{}\n- 思考进度：{}\n- 并发上限：{}（修改后需重启）",
             runtime.provider_name,
+            runtime.api_format.as_str(),
             runtime.base_url,
             if runtime.key_overridden {
                 "已设置自定义 Key"
@@ -393,6 +440,7 @@ impl AiPlugin {
             },
             runtime.primary_model,
             runtime.search_fallback_model,
+            native_search_description(runtime.api_format),
             runtime.config.thinking_level,
             if runtime.config.default_search {
                 "开启"
@@ -428,13 +476,13 @@ impl AiPlugin {
             "# 🤖 TeleBot AI 帮助\n\n\
 ## 基本用法\n\n\
 - `.ai <问题>` — 按当前默认模式回答；现在默认是 **{default_mode}**。\n\
-- `.ai search <问题>` / `.ai s <问题>` — 强制使用 Gemini 原生 Google Search。\n\
+ - `.ai search <问题>` / `.ai s <问题>` — 强制使用当前 API 格式的原生搜索；Chat Completions 不提供标准搜索。\n\
 - `.ai chat <问题>` / `.ai c <问题>` — 强制不联网，直接使用模型回答。\n\
 - `.ai status` / `.ai config` — 查看当前生效配置，不显示 Key 内容。\n\
 - `.ai help` / `.ai ?` — 显示本帮助。\n\n\
 ## 回复消息与图片\n\n\
 - 回复一条文字消息再发送 `.ai`：把被回复文字作为问题。\n\
-- 回复图片、静态贴纸或带图消息：图片会一并交给 Gemini。\n\
+ - 回复图片、静态贴纸或带图消息：图片会按当前 API 格式一并提交。\n\
 - 回复图片后发送 `.ai <问题>`：结合图片和你的问题联网搜索。\n\
 - 回复图片后发送 `.ai chat <问题>`：结合图片回答，但不联网。\n\
 - 最多处理 4 张图片；单张不超过 8 MiB，总计不超过 12 MiB。\n\n\
@@ -445,7 +493,8 @@ impl AiPlugin {
 - `.ai context off` — 停止继续使用上下文。\n\
 - `.ai reset` — 清除当前聊天已经保存的上下文。\n\n\
 ## 动态配置（仅限收藏夹）\n\n\
-- `.ai config provider <名称> <BaseURL>` — 更换 Gemini 兼容服务商。\n\
+ - `.ai config provider <API格式> <名称> <BaseURL>` — 更换 API 格式、显示名称和端点。\n\
+ - API 格式：`gemini_interactions`、`openai_chat_completions`、`openai_responses`。\n\
 - `.ai config key <Key>` — 设置并持久化 Key；消息会先被隐藏，Key 不回显。\n\
 - `.ai config clear-key` — 改回服务器环境变量中的 Key。\n\
 - `.ai config model <主模型> [搜索备用模型]` — 更换模型。\n\
@@ -536,23 +585,34 @@ impl AiPlugin {
         self.ensure_saved_messages(context).await?;
         match action.as_str() {
             "provider" => {
-                if args.len() != 3 {
-                    bail!("用法：.ai config provider <名称> <BaseURL>");
+                if !(3..=4).contains(&args.len()) {
+                    bail!("用法：.ai config provider [API格式] <名称> <BaseURL>");
                 }
                 let current = self.runtime.read().await.clone();
                 let mut options = AiRuntimeOptions::from(&current);
-                options.provider_name = args[1].clone();
-                options.base_url = args[2].clone();
+                let (format, name, base_url) = if args.len() == 4 {
+                    (args[1].parse::<AiApiFormat>()?, &args[2], &args[3])
+                } else {
+                    (current.api_format, &args[1], &args[2])
+                };
+                options.api_format = format;
+                options.provider_name = name.to_owned();
+                options.base_url = base_url.to_owned();
                 let updated = AiRuntime::build(options)?;
                 self.store
                     .set_setting(AI_PROVIDER_SETTING, &updated.provider_name)
                     .await?;
                 self.store
+                    .set_setting(AI_API_FORMAT_SETTING, updated.api_format.as_str())
+                    .await?;
+                self.store
                     .set_setting(AI_BASE_URL_SETTING, &updated.base_url)
                     .await?;
                 let message = format!(
-                    "✅ 服务商已设置为 {}\nBaseURL：{}",
-                    updated.provider_name, updated.base_url
+                    "✅ AI 服务商已更新\n名称：{}\nAPI 格式：{}\nBaseURL：{}",
+                    updated.provider_name,
+                    updated.api_format.as_str(),
+                    updated.base_url
                 );
                 self.install_runtime(updated).await;
                 replace_with_chunks(&context.client, &context.message, &message).await
@@ -824,6 +884,7 @@ impl AiPlugin {
                 let defaults = self.defaults.read().await.clone();
                 let updated = AiRuntime::build(AiRuntimeOptions {
                     provider_name: default_provider_name(&defaults.config),
+                    api_format: defaults.config.api_format,
                     base_url: defaults.config.base_url.clone(),
                     api_key: defaults.env_api_key.clone(),
                     primary_model: defaults.config.model.clone(),
@@ -903,6 +964,10 @@ async fn runtime_from_store(defaults: &AiDefaults, store: &Store) -> Result<AiRu
         .get_setting(AI_PROVIDER_SETTING)
         .await?
         .unwrap_or_else(|| default_provider_name(&config));
+    let api_format = match store.get_setting(AI_API_FORMAT_SETTING).await? {
+        Some(value) => value.parse::<AiApiFormat>()?,
+        None => config.api_format,
+    };
     let base_url = store
         .get_setting(AI_BASE_URL_SETTING)
         .await?
@@ -925,6 +990,7 @@ async fn runtime_from_store(defaults: &AiDefaults, store: &Store) -> Result<AiRu
 
     AiRuntime::build(AiRuntimeOptions {
         provider_name,
+        api_format,
         base_url,
         api_key,
         primary_model,
@@ -1224,7 +1290,7 @@ fn both_ai_paths_failed(
     anyhow!("AI 服务暂时没有返回有效内容，请稍后重试")
 }
 
-fn append_sources(answer: &mut String, sources: &[GeminiSource]) {
+fn append_sources(answer: &mut String, sources: &[AiSource]) {
     if sources.is_empty() {
         return;
     }
@@ -1395,6 +1461,570 @@ fn truncate_chars(input: &str, max: usize) -> String {
     }
 }
 
+#[async_trait]
+trait AiProviderBackend: Send + Sync {
+    fn supports_native_search(&self) -> bool;
+
+    async fn generate_search_hedged(
+        &self,
+        query: &str,
+        images: &[AiImage],
+        total_limit: Duration,
+        hedge_delay: Duration,
+    ) -> Result<AiAnswer>;
+
+    async fn generate_chat_with_timeout(
+        &self,
+        query: &str,
+        images: &[AiImage],
+        limit: Duration,
+    ) -> Result<String>;
+}
+
+fn build_provider(
+    api_format: AiApiFormat,
+    config: &AiConfig,
+    base_url: &str,
+    primary_model: &str,
+    search_fallback_model: &str,
+    api_key: String,
+) -> Result<Arc<dyn AiProviderBackend>> {
+    match api_format {
+        AiApiFormat::GeminiInteractions => Ok(Arc::new(GeminiProvider::new_runtime(
+            config,
+            base_url,
+            primary_model,
+            search_fallback_model,
+            api_key,
+        )?)),
+        AiApiFormat::OpenaiChatCompletions | AiApiFormat::OpenaiResponses => {
+            Ok(Arc::new(OpenAiCompatibleProvider::new_runtime(
+                api_format,
+                config,
+                base_url,
+                primary_model,
+                search_fallback_model,
+                api_key,
+            )?))
+        }
+    }
+}
+
+fn native_search_description(api_format: AiApiFormat) -> &'static str {
+    match api_format {
+        AiApiFormat::GeminiInteractions => "Google Search / Gemini Interactions",
+        AiApiFormat::OpenaiResponses => "web_search / OpenAI Responses",
+        AiApiFormat::OpenaiChatCompletions => "不支持（Chat Completions 无标准搜索工具）",
+    }
+}
+
+fn build_ai_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .pool_idle_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .user_agent(concat!("telebot/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("failed to construct AI HTTP client")
+}
+
+#[derive(Clone)]
+struct OpenAiCompatibleProvider {
+    http: reqwest::Client,
+    endpoint: String,
+    api_key: String,
+    system_prompt: String,
+    primary_model: String,
+    search_fallback_model: String,
+    max_output_tokens: u32,
+    api_format: AiApiFormat,
+}
+
+impl OpenAiCompatibleProvider {
+    fn new_runtime(
+        api_format: AiApiFormat,
+        config: &AiConfig,
+        base_url: &str,
+        primary_model: &str,
+        search_fallback_model: &str,
+        api_key: String,
+    ) -> Result<Self> {
+        if !matches!(
+            api_format,
+            AiApiFormat::OpenaiChatCompletions | AiApiFormat::OpenaiResponses
+        ) {
+            bail!("OpenAI-compatible provider received an unsupported API format");
+        }
+        validate_model("ai.model", primary_model)?;
+        validate_model("ai.search_fallback_model", search_fallback_model)?;
+        validate_api_key(&api_key)?;
+        let base_url = normalize_base_url(base_url)?;
+        let suffix = match api_format {
+            AiApiFormat::OpenaiChatCompletions => "chat/completions",
+            AiApiFormat::OpenaiResponses => "responses",
+            AiApiFormat::GeminiInteractions => unreachable!(),
+        };
+        let endpoint = append_api_endpoint(&base_url, suffix);
+        Ok(Self {
+            http: build_ai_http_client()?,
+            endpoint,
+            api_key,
+            system_prompt: config.system_prompt.clone(),
+            primary_model: primary_model.to_owned(),
+            search_fallback_model: search_fallback_model.to_owned(),
+            max_output_tokens: config.max_output_tokens,
+            api_format,
+        })
+    }
+
+    async fn generate_search(
+        &self,
+        query: &str,
+        images: &[AiImage],
+        total_limit: Duration,
+        hedge_delay: Duration,
+    ) -> Result<AiAnswer> {
+        if self.api_format != AiApiFormat::OpenaiResponses {
+            bail!(
+                "{} does not define a standard native web-search tool",
+                self.api_format.as_str()
+            );
+        }
+        let started = Instant::now();
+        if self.primary_model == self.search_fallback_model {
+            return self
+                .request(&self.primary_model, query, true, images, total_limit)
+                .await
+                .map_err(anyhow::Error::from);
+        }
+
+        let deadline = started + total_limit;
+        let mut primary =
+            Box::pin(self.request(&self.primary_model, query, true, images, total_limit));
+        let primary_error = match timeout(hedge_delay, primary.as_mut()).await {
+            Ok(Ok(answer)) => return Ok(answer),
+            Ok(Err(error)) => Some(error),
+            Err(_) => {
+                info!(
+                    model = self.primary_model,
+                    hedge_after_ms = hedge_delay.as_millis(),
+                    "OpenAI-compatible native search is slow; starting fallback model"
+                );
+                None
+            }
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining < Duration::from_millis(500) {
+            bail!(
+                "OpenAI-compatible native search deadline exceeded after {:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+        }
+        let mut fallback =
+            Box::pin(self.request(&self.search_fallback_model, query, true, images, remaining));
+
+        if let Some(primary_error) = primary_error {
+            return fallback.await.map_err(|fallback_error| {
+                native_search_models_failed(&primary_error, &fallback_error, started.elapsed())
+            });
+        }
+        tokio::select! {
+            primary_result = &mut primary => match primary_result {
+                Ok(answer) => Ok(answer),
+                Err(primary_error) => match fallback.await {
+                    Ok(answer) => Ok(answer),
+                    Err(fallback_error) => Err(native_search_models_failed(
+                        &primary_error,
+                        &fallback_error,
+                        started.elapsed(),
+                    )),
+                },
+            },
+            fallback_result = &mut fallback => match fallback_result {
+                Ok(answer) => Ok(answer),
+                Err(fallback_error) => match primary.await {
+                    Ok(answer) => Ok(answer),
+                    Err(primary_error) => Err(native_search_models_failed(
+                        &primary_error,
+                        &fallback_error,
+                        started.elapsed(),
+                    )),
+                },
+            },
+        }
+    }
+
+    async fn generate_chat(
+        &self,
+        query: &str,
+        images: &[AiImage],
+        limit: Duration,
+    ) -> Result<String> {
+        let started = Instant::now();
+        let deadline = started + limit;
+        let mut last_error = None;
+        for attempt in 0..2 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining < Duration::from_millis(500) {
+                break;
+            }
+            match self
+                .request(&self.primary_model, query, false, images, remaining)
+                .await
+            {
+                Ok(answer) => return Ok(answer.text),
+                Err(error) => {
+                    let delay = error.retry_delay();
+                    let retry = error.transient
+                        && attempt == 0
+                        && delay + Duration::from_millis(500) < remaining;
+                    last_error = Some(error);
+                    if !retry {
+                        break;
+                    }
+                    sleep(delay).await;
+                }
+            }
+        }
+        let error = last_error.unwrap_or_else(|| {
+            ProviderError::transient("OpenAI-compatible request deadline exceeded")
+        });
+        Err(anyhow!(
+            "OpenAI-compatible request failed after {:.1}s: {error}",
+            started.elapsed().as_secs_f32()
+        ))
+    }
+
+    async fn request(
+        &self,
+        model: &str,
+        query: &str,
+        use_search: bool,
+        images: &[AiImage],
+        limit: Duration,
+    ) -> std::result::Result<AiAnswer, ProviderError> {
+        timeout(limit, self.request_inner(model, query, use_search, images))
+            .await
+            .map_err(|_| ProviderError::transient("OpenAI-compatible request timed out"))?
+    }
+
+    async fn request_inner(
+        &self,
+        model: &str,
+        query: &str,
+        use_search: bool,
+        images: &[AiImage],
+    ) -> std::result::Result<AiAnswer, ProviderError> {
+        let body = match self.api_format {
+            AiApiFormat::OpenaiChatCompletions => build_chat_completions_body(
+                model,
+                &self.system_prompt,
+                query,
+                images,
+                self.max_output_tokens,
+            ),
+            AiApiFormat::OpenaiResponses => build_responses_body(
+                model,
+                &self.system_prompt,
+                query,
+                images,
+                self.max_output_tokens,
+                use_search,
+            ),
+            AiApiFormat::GeminiInteractions => unreachable!(),
+        };
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(ProviderError::from_reqwest)?;
+        let status = response.status();
+        let retry_after = retry_after_delay(response.headers());
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_AI_RESPONSE_BYTES as u64)
+        {
+            return Err(ProviderError::permanent(
+                "OpenAI-compatible response was too large",
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(ProviderError::from_reqwest)?;
+        if bytes.len() > MAX_AI_RESPONSE_BYTES {
+            return Err(ProviderError::permanent(
+                "OpenAI-compatible response was too large",
+            ));
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            ProviderError::permanent(format!("invalid OpenAI-compatible JSON response: {error}"))
+        })?;
+        if !status.is_success() {
+            let message = value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("provider returned an unknown error");
+            return Err(ProviderError::http(
+                status,
+                message,
+                retry_after,
+                &self.api_key,
+            ));
+        }
+        match self.api_format {
+            AiApiFormat::OpenaiChatCompletions => parse_chat_completions_response(&value, model),
+            AiApiFormat::OpenaiResponses => parse_responses_response(&value, model, use_search),
+            AiApiFormat::GeminiInteractions => unreachable!(),
+        }
+    }
+}
+
+#[async_trait]
+impl AiProviderBackend for OpenAiCompatibleProvider {
+    fn supports_native_search(&self) -> bool {
+        self.api_format == AiApiFormat::OpenaiResponses
+    }
+
+    async fn generate_search_hedged(
+        &self,
+        query: &str,
+        images: &[AiImage],
+        total_limit: Duration,
+        hedge_delay: Duration,
+    ) -> Result<AiAnswer> {
+        self.generate_search(query, images, total_limit, hedge_delay)
+            .await
+    }
+
+    async fn generate_chat_with_timeout(
+        &self,
+        query: &str,
+        images: &[AiImage],
+        limit: Duration,
+    ) -> Result<String> {
+        self.generate_chat(query, images, limit).await
+    }
+}
+
+fn append_api_endpoint(base_url: &str, suffix: &str) -> String {
+    if base_url.ends_with(suffix) {
+        base_url.to_owned()
+    } else {
+        format!("{base_url}/{suffix}")
+    }
+}
+
+fn build_chat_completions_body(
+    model: &str,
+    system_prompt: &str,
+    query: &str,
+    images: &[AiImage],
+    max_output_tokens: u32,
+) -> Value {
+    let user_content = if images.is_empty() {
+        Value::String(query.to_owned())
+    } else {
+        let mut content = Vec::with_capacity(images.len() + 1);
+        content.push(json!({"type": "text", "text": query}));
+        for image in images {
+            content.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", image.mime_type, image.base64_data)
+                }
+            }));
+        }
+        Value::Array(content)
+    };
+    json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "max_tokens": max_output_tokens,
+        "stream": false
+    })
+}
+
+fn build_responses_body(
+    model: &str,
+    system_prompt: &str,
+    query: &str,
+    images: &[AiImage],
+    max_output_tokens: u32,
+    use_search: bool,
+) -> Value {
+    let mut content = Vec::with_capacity(images.len() + 1);
+    content.push(json!({"type": "input_text", "text": query}));
+    for image in images {
+        content.push(json!({
+            "type": "input_image",
+            "image_url": format!("data:{};base64,{}", image.mime_type, image.base64_data)
+        }));
+    }
+    let instructions = if use_search {
+        format!(
+            "{system_prompt}\n\n本次请求必须先使用 web_search 获取相关资料，再基于搜索结果回答。"
+        )
+    } else {
+        system_prompt.to_owned()
+    };
+    let mut body = json!({
+        "model": model,
+        "instructions": instructions,
+        "input": [{"role": "user", "content": content}],
+        "max_output_tokens": max_output_tokens,
+        "store": false,
+        "stream": false
+    });
+    if use_search {
+        body["tools"] = json!([{"type": "web_search"}]);
+    }
+    body
+}
+
+fn parse_chat_completions_response(
+    value: &Value,
+    requested_model: &str,
+) -> std::result::Result<AiAnswer, ProviderError> {
+    let message = value
+        .pointer("/choices/0/message")
+        .ok_or_else(|| ProviderError::permanent("chat completion did not contain a message"))?;
+    let mut text = String::new();
+    let mut sources = Vec::new();
+    let mut seen_sources = HashSet::new();
+    match message.get("content") {
+        Some(Value::String(content)) => text.push_str(content),
+        Some(Value::Array(content)) => {
+            for block in content {
+                if let Some(value) = block.get("text").and_then(Value::as_str) {
+                    text.push_str(value);
+                } else if let Some(value) = block.pointer("/text/value").and_then(Value::as_str) {
+                    text.push_str(value);
+                }
+                collect_url_citations(block.get("annotations"), &mut sources, &mut seen_sources);
+            }
+        }
+        _ => {}
+    }
+    collect_url_citations(message.get("annotations"), &mut sources, &mut seen_sources);
+    if text.trim().is_empty() {
+        return Err(ProviderError::transient(
+            "chat completion returned an empty message",
+        ));
+    }
+    Ok(AiAnswer {
+        text,
+        sources,
+        model: response_model(value, requested_model),
+        search_calls: 0,
+    })
+}
+
+fn parse_responses_response(
+    value: &Value,
+    requested_model: &str,
+    use_search: bool,
+) -> std::result::Result<AiAnswer, ProviderError> {
+    let mut text = String::new();
+    let mut sources = Vec::new();
+    let mut seen_sources = HashSet::new();
+    let mut search_calls = 0usize;
+    for output in value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match output.get("type").and_then(Value::as_str) {
+            Some("web_search_call") => search_calls += 1,
+            Some("message") => {
+                for block in output
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if block.get("type").and_then(Value::as_str) == Some("output_text") {
+                        if let Some(value) = block.get("text").and_then(Value::as_str) {
+                            text.push_str(value);
+                        }
+                        collect_url_citations(
+                            block.get("annotations"),
+                            &mut sources,
+                            &mut seen_sources,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if text.trim().is_empty()
+        && let Some(output_text) = value.get("output_text").and_then(Value::as_str)
+    {
+        text.push_str(output_text);
+    }
+    if text.trim().is_empty() {
+        return Err(ProviderError::transient(
+            "Responses API returned no output text",
+        ));
+    }
+    if use_search && search_calls == 0 {
+        return Err(ProviderError::transient(
+            "Responses API did not call the standard web_search tool",
+        ));
+    }
+    Ok(AiAnswer {
+        text,
+        sources,
+        model: response_model(value, requested_model),
+        search_calls,
+    })
+}
+
+fn collect_url_citations(
+    annotations: Option<&Value>,
+    sources: &mut Vec<AiSource>,
+    seen_sources: &mut HashSet<String>,
+) {
+    for annotation in annotations.and_then(Value::as_array).into_iter().flatten() {
+        if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+            continue;
+        }
+        let citation = annotation.get("url_citation").unwrap_or(annotation);
+        let Some(url) = citation.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        if !url.starts_with("https://") || !seen_sources.insert(url.to_owned()) {
+            continue;
+        }
+        let title = citation
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or("参考资料");
+        sources.push(AiSource {
+            title: title.to_owned(),
+            url: url.to_owned(),
+        });
+    }
+}
+
+fn response_model(value: &Value, requested_model: &str) -> String {
+    value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(requested_model)
+        .to_owned()
+}
+
 #[derive(Clone)]
 struct GeminiProvider {
     http: reqwest::Client,
@@ -1408,16 +2038,6 @@ struct GeminiProvider {
 }
 
 impl GeminiProvider {
-    fn new(config: &AiConfig, api_key: String) -> Result<Self> {
-        Self::new_runtime(
-            config,
-            &config.base_url,
-            &config.model,
-            &config.search_fallback_model,
-            api_key,
-        )
-    }
-
     fn new_runtime(
         config: &AiConfig,
         base_url: &str,
@@ -1434,15 +2054,8 @@ impl GeminiProvider {
         } else {
             format!("{base_url}/v1beta/interactions")
         };
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .pool_idle_timeout(Duration::from_secs(60))
-            .tcp_keepalive(Duration::from_secs(30))
-            .user_agent(concat!("telebot/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .context("failed to construct AI HTTP client")?;
         Ok(Self {
-            http,
+            http: build_ai_http_client()?,
             endpoint,
             api_key,
             system_prompt: config.system_prompt.clone(),
@@ -1459,7 +2072,7 @@ impl GeminiProvider {
         images: &[AiImage],
         total_limit: Duration,
         hedge_delay: Duration,
-    ) -> Result<GeminiAnswer> {
+    ) -> Result<AiAnswer> {
         let started = Instant::now();
         let deadline = started + total_limit;
         let mut primary =
@@ -1540,12 +2153,15 @@ impl GeminiProvider {
             {
                 Ok(answer) => return Ok(answer.text),
                 Err(error) => {
-                    let retry = error.transient && attempt == 0;
+                    let delay = error.retry_delay();
+                    let retry = error.transient
+                        && attempt == 0
+                        && delay + Duration::from_millis(500) < remaining;
                     last_error = Some(error);
                     if !retry {
                         break;
                     }
-                    sleep(Duration::from_millis(150 + rand::random_range(0..150))).await;
+                    sleep(delay).await;
                 }
             }
         }
@@ -1564,7 +2180,7 @@ impl GeminiProvider {
         use_search: bool,
         images: &[AiImage],
         limit: Duration,
-    ) -> std::result::Result<GeminiAnswer, ProviderError> {
+    ) -> std::result::Result<AiAnswer, ProviderError> {
         timeout(limit, self.request_inner(model, query, use_search, images))
             .await
             .map_err(|_| ProviderError::transient("Gemini request timed out"))?
@@ -1576,7 +2192,7 @@ impl GeminiProvider {
         query: &str,
         use_search: bool,
         images: &[AiImage],
-    ) -> std::result::Result<GeminiAnswer, ProviderError> {
+    ) -> std::result::Result<AiAnswer, ProviderError> {
         let mut input = Vec::with_capacity(images.len() + 1);
         for image in images {
             input.push(json!({
@@ -1618,6 +2234,7 @@ impl GeminiProvider {
             .await
             .map_err(ProviderError::from_reqwest)?;
         let status = response.status();
+        let retry_after = retry_after_delay(response.headers());
         if response
             .content_length()
             .is_some_and(|size| size > MAX_AI_RESPONSE_BYTES as u64)
@@ -1640,10 +2257,12 @@ impl GeminiProvider {
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or("Gemini returned an unknown error");
-            return Err(ProviderError {
-                message: format!("Gemini HTTP {}: {}", status.as_u16(), message),
-                transient: is_transient_status(status),
-            });
+            return Err(ProviderError::http(
+                status,
+                message,
+                retry_after,
+                &self.api_key,
+            ));
         }
 
         let steps = value
@@ -1691,7 +2310,7 @@ impl GeminiProvider {
                                 .and_then(Value::as_str)
                                 .filter(|title| !title.trim().is_empty())
                                 .unwrap_or("参考资料");
-                            sources.push(GeminiSource {
+                            sources.push(AiSource {
                                 title: title.to_owned(),
                                 url: url.to_owned(),
                             });
@@ -1710,12 +2329,38 @@ impl GeminiProvider {
             ));
         }
 
-        Ok(GeminiAnswer {
+        Ok(AiAnswer {
             text,
             sources,
             model: model.to_owned(),
             search_calls,
         })
+    }
+}
+
+#[async_trait]
+impl AiProviderBackend for GeminiProvider {
+    fn supports_native_search(&self) -> bool {
+        true
+    }
+
+    async fn generate_search_hedged(
+        &self,
+        query: &str,
+        images: &[AiImage],
+        total_limit: Duration,
+        hedge_delay: Duration,
+    ) -> Result<AiAnswer> {
+        GeminiProvider::generate_search_hedged(self, query, images, total_limit, hedge_delay).await
+    }
+
+    async fn generate_chat_with_timeout(
+        &self,
+        query: &str,
+        images: &[AiImage],
+        limit: Duration,
+    ) -> Result<String> {
+        GeminiProvider::generate_chat_with_timeout(self, query, images, limit).await
     }
 }
 
@@ -1725,7 +2370,7 @@ fn native_search_models_failed(
     elapsed: Duration,
 ) -> anyhow::Error {
     anyhow!(
-        "Gemini native search failed after {:.1}s; primary: {}; fallback: {}",
+        "native search failed after {:.1}s; primary: {}; fallback: {}",
         elapsed.as_secs_f32(),
         primary,
         fallback
@@ -1754,6 +2399,7 @@ fn empty_interaction_error(value: &Value) -> ProviderError {
 struct ProviderError {
     message: String,
     transient: bool,
+    retry_after: Option<Duration>,
 }
 
 impl ProviderError {
@@ -1761,19 +2407,42 @@ impl ProviderError {
         Self {
             message: message.into(),
             transient: true,
+            retry_after: None,
         }
     }
     fn permanent(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             transient: false,
+            retry_after: None,
+        }
+    }
+    fn http(
+        status: StatusCode,
+        message: &str,
+        retry_after: Option<Duration>,
+        api_key: &str,
+    ) -> Self {
+        Self {
+            message: format!(
+                "provider HTTP {}: {}",
+                status.as_u16(),
+                sanitize_provider_error(message, api_key)
+            ),
+            transient: is_transient_status(status),
+            retry_after,
         }
     }
     fn from_reqwest(error: reqwest::Error) -> Self {
         Self {
             transient: error.is_timeout() || error.is_connect() || error.is_request(),
             message: error.to_string(),
+            retry_after: None,
         }
+    }
+    fn retry_delay(&self) -> Duration {
+        self.retry_after
+            .unwrap_or_else(|| Duration::from_millis(150 + rand::random_range(0..150)))
     }
 }
 
@@ -1788,12 +2457,34 @@ impl std::error::Error for ProviderError {}
 fn is_transient_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::CONFLICT
         || status.is_server_error()
+}
+
+fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+fn sanitize_provider_error(value: &str, api_key: &str) -> String {
+    let sanitized = if api_key.is_empty() {
+        value.to_owned()
+    } else {
+        value.replace(api_key, "[redacted]")
+    };
+    let sanitized = sanitized.replace(['\r', '\n'], " ");
+    take_chars(&sanitized, 500)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn empty_interaction_is_retryable_and_keeps_step_metadata() {
@@ -1809,7 +2500,7 @@ mod tests {
 
     #[test]
     fn native_sources_are_appended_and_sanitized() {
-        let sources = vec![GeminiSource {
+        let sources = vec![AiSource {
             title: "Windows local account [guide]".to_owned(),
             url: "https://example.com/guide".to_owned(),
         }];
@@ -1832,6 +2523,217 @@ mod tests {
         assert!(normalize_base_url("http://example.com").is_err());
         assert!(normalize_base_url("https://user@example.com").is_err());
         assert!(normalize_base_url("https://example.com?token=secret").is_err());
+    }
+
+    #[test]
+    fn openai_endpoints_are_appended_once() {
+        assert_eq!(
+            append_api_endpoint("https://api.example.com/v1", "chat/completions"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            append_api_endpoint(
+                "https://api.example.com/v1/chat/completions",
+                "chat/completions"
+            ),
+            "https://api.example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_body_uses_only_standard_fields() {
+        let image = AiImage {
+            mime_type: "image/png".to_owned(),
+            base64_data: "aW1hZ2U=".to_owned(),
+            byte_len: 5,
+        };
+        let body = build_chat_completions_body("test-model", "system", "question", &[image], 512);
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["stream"], false);
+        assert_eq!(
+            body.pointer("/messages/1/content/1/type"),
+            Some(&json!("image_url"))
+        );
+        assert_eq!(
+            body.pointer("/messages/1/content/1/image_url/url"),
+            Some(&json!("data:image/png;base64,aW1hZ2U="))
+        );
+        assert!(body.get("plugins").is_none());
+        assert!(body.get("provider").is_none());
+    }
+
+    #[test]
+    fn responses_body_adds_only_the_standard_search_tool() {
+        let body = build_responses_body("test-model", "system", "question", &[], 512, true);
+        assert_eq!(body.pointer("/tools/0/type"), Some(&json!("web_search")));
+        assert_eq!(
+            body.pointer("/input/0/content/0/type"),
+            Some(&json!("input_text"))
+        );
+        assert_eq!(body["store"], false);
+        assert!(body.get("plugins").is_none());
+    }
+
+    #[test]
+    fn chat_completions_parser_accepts_standard_citations() {
+        let value = json!({
+            "model": "returned-model",
+            "choices": [{
+                "message": {
+                    "content": "answer",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "url_citation": {
+                            "title": "Example",
+                            "url": "https://example.com/source"
+                        }
+                    }]
+                }
+            }]
+        });
+        let answer = parse_chat_completions_response(&value, "requested-model").unwrap();
+        assert_eq!(answer.text, "answer");
+        assert_eq!(answer.model, "returned-model");
+        assert_eq!(answer.sources.len(), 1);
+        assert_eq!(answer.sources[0].url, "https://example.com/source");
+    }
+
+    #[test]
+    fn responses_parser_requires_a_real_search_call() {
+        let value = json!({
+            "model": "test-model",
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "answer",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "title": "Example",
+                        "url": "https://example.com/source"
+                    }]
+                }]
+            }]
+        });
+        let error = parse_responses_response(&value, "test-model", true).unwrap_err();
+        assert!(error.transient);
+        assert!(error.message.contains("did not call"));
+
+        let mut searched = value;
+        searched["output"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, json!({"type": "web_search_call", "status": "completed"}));
+        let answer = parse_responses_response(&searched, "test-model", true).unwrap();
+        assert_eq!(answer.search_calls, 1);
+        assert_eq!(answer.sources.len(), 1);
+    }
+
+    #[test]
+    fn malformed_openai_responses_fail_without_best_effort_text() {
+        assert!(parse_chat_completions_response(&json!({"choices": []}), "model").is_err());
+        assert!(parse_responses_response(&json!({"output": []}), "model", false).is_err());
+    }
+
+    #[test]
+    fn provider_errors_are_bounded_and_single_line() {
+        let value = format!("secret-looking upstream text\n{}", "x".repeat(800));
+        let error = ProviderError::http(StatusCode::BAD_GATEWAY, &value, None, "secret-looking");
+        assert!(!error.message.contains('\n'));
+        assert!(!error.message.contains("secret-looking"));
+        assert!(error.message.chars().count() < 550);
+        assert!(error.transient);
+    }
+
+    #[tokio::test]
+    async fn openai_transport_accepts_json_with_incorrect_content_type() {
+        let response = json!({
+            "model": "test-model",
+            "choices": [{"message": {"content": "transport ok"}}]
+        })
+        .to_string();
+        let (base_url, server) = spawn_single_response_server(response);
+        let parsed: crate::config::Config =
+            toml::from_str(include_str!("../../config.example.toml")).unwrap();
+        let provider = OpenAiCompatibleProvider::new_runtime(
+            AiApiFormat::OpenaiChatCompletions,
+            &parsed.ai,
+            &format!("{base_url}/v1"),
+            "test-model",
+            "test-model",
+            "test-key".to_owned(),
+        )
+        .unwrap();
+
+        let answer = provider
+            .generate_chat("hello", &[], Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(answer, "transport ok");
+
+        let request = server.join().unwrap();
+        let request_text = String::from_utf8(request).unwrap();
+        let request_lower = request_text.to_ascii_lowercase();
+        assert!(request_text.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+        assert!(request_lower.contains("authorization: bearer test-key\r\n"));
+        assert!(request_text.contains("\"model\":\"test-model\""));
+        assert!(!request_text.contains("\"plugins\""));
+    }
+
+    fn spawn_single_response_server(
+        response_body: String,
+    ) -> (String, thread::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let mut expected_length = None;
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if expected_length.is_none()
+                    && let Some(header_end) = find_bytes(&request, b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected_length = Some(header_end + 4 + content_length);
+                }
+                if expected_length.is_some_and(|length| request.len() >= length) {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 
     #[test]

@@ -9,8 +9,8 @@ Initial commands:
 - `.ai <question>`: use native web search by default.
 - Reply to text, a selected quote, a photo or a static sticker with `.ai` to use it for this request.
 - `.ai chat <question>` / `.ai search <question>`: force offline or native-search mode.
-- `.ai config`: inspect the active Gemini-compatible provider without revealing its key.
-- `.ai config provider <name> <base_url>`: change the provider label and Gemini-compatible endpoint.
+- `.ai config`: inspect the active provider and API format without revealing its key.
+- `.ai config provider <api_format> <name> <base_url>`: change the wire format, display name and endpoint.
 - `.ai config key <key>` / `.ai config model <primary> [search_fallback]`: update credentials or models.
 - `.ai config prompt|thinking|search|timeout|tokens|collapse|message`: update common AI behavior and progress text immediately without rebuilding.
 - `.ai config reload`: reload the server AI/message TOML while keeping SQLite runtime overrides; `.ai config reset` clears those overrides.
@@ -38,12 +38,34 @@ in the local application database. `.ai config key` is accepted only in Saved Me
 redacts the command, never echoes the value, and stores it in the owner-protected local database;
 otherwise the key continues to come from the server environment.
 
-Default web answers continue to use Gemini native Google Search through the Interactions API. The
-active provider can be replaced at runtime with a Gemini-compatible endpoint while keeping the same
-grounding path. Stable primary and fallback models are hedged, and Google citation annotations are
+The AI adapter supports `gemini_interactions`, `openai_chat_completions` and `openai_responses`.
+OpenAI-compatible services use only the selected standard wire format: the code contains no
+gateway-specific branches. Set `base_url` to the API prefix, such as `https://api.example.com/v1`;
+telebot appends `chat/completions` or `responses` unless the URL already ends with that endpoint.
+
+Gemini Interactions and OpenAI Responses support native web search. OpenAI Chat Completions has no
+standard web-search tool, so a forced search falls back to a clearly labelled non-search answer.
+Native-search primary and fallback models are hedged, and HTTPS citation annotations are
 deduplicated and rendered as Telegram links. Image-grounded searches have a separate, longer total
-timeout so slow multimodal requests do not change the text-only latency budget; no third-party
-search-result scraping is used.
+timeout so slow multimodal requests do not change the text-only latency budget.
+
+For a generic Chat Completions endpoint, change these fields in `config.toml` and provide the named
+environment variable outside the repository:
+
+```toml
+[ai]
+provider = "generic-oai"
+api_format = "openai_chat_completions"
+api_key_env = "TELEBOT_AI_API_KEY"
+base_url = "https://api.example.com/v1"
+model = "example-model"
+search_fallback_model = "example-model"
+default_search = false
+```
+
+Use `openai_responses` only when the endpoint implements that protocol. It enables the standard
+Responses `web_search` tool and requires a search fallback model. Telebot does not infer a protocol
+from the provider name, model name or URL.
 
 Frequently adjusted AI values are runtime settings stored in SQLite. Provider, BaseURL, Key, models,
 system prompt, thinking level, default-search mode, timeouts, maximum output, quote collapsing and AI
@@ -54,7 +76,7 @@ TOML section supplies server defaults. Concurrency and plugin enable/disable rem
 
 - `src/main.rs`: process lifecycle, Telegram update stream and bounded command workers.
 - `src/plugin.rs`: small plugin trait and command router; future features do not touch the connection loop.
-- `src/plugins/ai.rs`: dynamic Gemini-compatible runtime settings, bounded context and native-search fallback.
+- `src/plugins/ai.rs`: protocol-neutral runtime settings, Gemini and OpenAI-compatible adapters, bounded context and native-search fallback.
 - `src/plugins/quote.rs`: quote generation, bounded media archive and Telegram sticker-set operations.
 - `src/telegram.rs`: Telegram-native Markdown formatting, expandable questions and answers and safe message splitting.
 - `src/store.rs`: asynchronous SQLite settings, bounded AI context and quote archive storage.

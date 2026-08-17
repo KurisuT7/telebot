@@ -54,6 +54,12 @@ Messages, validated, stored in SQLite and applied immediately. `.ai config reloa
 all `ai.runtime.*` overrides. AI concurrency and plugin enable/disable still require a service
 restart because they shape process resources and router registration.
 
+`ai.api_format` accepts `gemini_interactions`, `openai_chat_completions` or `openai_responses`.
+For an OpenAI-compatible endpoint, set `ai.base_url` to its versioned API prefix and choose the
+format implemented by that endpoint. Do not rely on model-name or URL auto-detection. Native web
+search is available only for Gemini Interactions and OpenAI Responses; Chat Completions falls back
+to a labelled non-search answer when a search command is used.
+
 ## Rollback
 
 ```sh

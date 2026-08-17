@@ -12,6 +12,7 @@ path = "/var/lib/telebot/telebot.db"
 [ai]
 enabled = true
 provider = "gemini"
+api_format = "gemini_interactions"
 api_key_env = "TELEBOT_GEMINI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com"
 model = "gemini-3.7-flash"

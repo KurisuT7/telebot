@@ -45,6 +45,6 @@ test "$(stat -c '%a' /etc/telebot/config.toml)" = "640"
 test "$(stat -c '%a' /etc/telebot/telebot.env)" = "600"
 test "$(stat -c '%a' /var/lib/telebot)" = "700"
 test "$(stat -c '%U:%G' /var/lib/telebot)" = "telebot:telebot"
-grep -q '^api_id = 0$' /etc/telebot/config.toml
-grep -q '^TELEBOT_TELEGRAM_API_HASH=replace_me$' /etc/telebot/telebot.env
+sudo grep -q '^api_id = 0$' /etc/telebot/config.toml
+sudo grep -q '^TELEBOT_TELEGRAM_API_HASH=replace_me$' /etc/telebot/telebot.env
 printf 'prepare install verified: %s\n' "$package_name"

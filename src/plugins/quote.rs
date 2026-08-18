@@ -301,6 +301,10 @@ impl QuotePlugin {
         let temporary =
             tempfile::tempdir().context("failed to create quote temporary directory")?;
         let selected = selected_reply_content(&context.message);
+        let sender_ids: Vec<i64> = messages
+            .iter()
+            .map(|message| sender_view(message).id)
+            .collect();
         let mut previous_sender = None;
         let mut avatar_count = 0usize;
         let mut payload_messages = Vec::with_capacity(messages.len());
@@ -308,7 +312,9 @@ impl QuotePlugin {
         for (index, message) in messages.iter().enumerate() {
             let sender = sender_view(message);
             let sender_id = sender.id;
-            let show_avatar = previous_sender != Some(sender_id);
+            let show_name = previous_sender != Some(sender_id);
+            let next_sender = sender_ids.get(index + 1).copied();
+            let show_avatar = sender_group_ends(sender_id, next_sender);
             previous_sender = Some(sender_id);
             let photo = if show_avatar {
                 self.download_avatar(&context.client, message.sender(), &temporary, index)
@@ -318,19 +324,14 @@ impl QuotePlugin {
             };
             avatar_count += usize::from(photo.is_some());
             let media = download_message_media(&context.client, message, &temporary, index).await;
-            let (text, entities) = if index == 0 {
-                selected.clone().unwrap_or_else(|| {
-                    (
-                        message.text().to_owned(),
-                        convert_entities(message.fmt_entities()),
-                    )
-                })
-            } else {
+            let selected_text = selection_for_message(message.id(), replied.id(), &selected);
+            let is_quote = selected_text.is_some();
+            let (text, entities) = selected_text.unwrap_or_else(|| {
                 (
                     message.text().to_owned(),
                     convert_entities(message.fmt_entities()),
                 )
-            };
+            });
             preview_lines.push(format!(
                 "{}：{}",
                 sender.display_name,
@@ -342,17 +343,24 @@ impl QuotePlugin {
             } else {
                 None
             };
+            let name = if show_name {
+                json!(sender.display_name)
+            } else {
+                Value::Bool(false)
+            };
             payload_messages.push(json!({
+                "chatId": sender_id,
                 "from": {
                     "id": sender_id,
-                    "name": if show_avatar { sender.display_name } else { String::new() },
-                    "first_name": if show_avatar { sender.first_name } else { String::new() },
-                    "last_name": if show_avatar { sender.last_name } else { String::new() },
-                    "username": if show_avatar { sender.username } else { String::new() },
+                    "name": name,
+                    "first_name": if show_name { sender.first_name } else { String::new() },
+                    "last_name": if show_name { sender.last_name } else { String::new() },
+                    "username": if show_name { sender.username } else { String::new() },
                     "photo": photo,
                 },
                 "text": text,
                 "entities": entities,
+                "isQuote": is_quote,
                 "avatar": show_avatar,
                 "media": media,
                 "replyMessage": reply_message,
@@ -968,6 +976,22 @@ fn selected_reply_content(message: &Message) -> Option<(String, Vec<Value>)> {
     }
 }
 
+fn selection_for_message(
+    message_id: i32,
+    anchor_id: i32,
+    selected: &Option<(String, Vec<Value>)>,
+) -> Option<(String, Vec<Value>)> {
+    (message_id == anchor_id).then(|| selected.clone()).flatten()
+}
+
+fn sender_group_starts(previous_sender: Option<i64>, sender_id: i64) -> bool {
+    previous_sender != Some(sender_id)
+}
+
+fn sender_group_ends(sender_id: i64, next_sender: Option<i64>) -> bool {
+    next_sender != Some(sender_id)
+}
+
 fn forward_label(message: &Message) -> Option<Value> {
     let tl::enums::MessageFwdHeader::Header(header) = message.forward_header()?;
     let label = header
@@ -1364,5 +1388,25 @@ mod tests {
             );
         }
         assert!(QuoteOutput::from_history_kind("unknown").is_err());
+    }
+
+    #[test]
+    fn applies_partial_selection_to_the_anchor_message_only() {
+        let selected = Some(("selected fragment".to_owned(), vec![json!({"type": "bold"})]));
+        assert_eq!(
+            selection_for_message(42, 42, &selected),
+            selected
+        );
+        assert_eq!(selection_for_message(41, 42, &selected), None);
+        assert_eq!(selection_for_message(42, 42, &None), None);
+    }
+
+    #[test]
+    fn keeps_names_at_group_start_and_avatars_at_group_end() {
+        assert!(sender_group_starts(None, 7));
+        assert!(!sender_group_starts(Some(7), 7));
+        assert!(!sender_group_ends(7, Some(7)));
+        assert!(sender_group_ends(7, Some(8)));
+        assert!(sender_group_ends(7, None));
     }
 }

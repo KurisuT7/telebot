@@ -13,25 +13,25 @@ path = "/var/lib/telebot/telebot.db"
 enabled = true
 provider = "gemini"
 api_format = "gemini_interactions"
-api_key_env = "TELEBOT_GEMINI_API_KEY"
+api_key_env = "TELEBOT_AI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com"
 model = "gemini-3.7-flash"
-# 留空表示抢跑重试仍使用主模型；如需备用模型，可在这里填写模型名。
+# Leave empty to hedge with the primary model, or set a different search model.
 search_fallback_model = ""
 thinking_level = "low"
 default_search = true
 system_prompt = "请使用中文准确、简洁地回答。使用联网搜索时优先采用可靠来源，并明确区分事实与推断。"
-# 每个聊天的滚动上下文轮数；0 为关闭，运行时可用 .ai context 修改。
+# Rolling context turns per chat. Set to 0 to disable; .ai context can change it at runtime.
 history_turns = 0
 collapse_long_messages = true
-# 兼容旧配置；Q/A 现由上面的统一开关控制，不再按长度分别判断。
+# Retained for compatibility with older configuration files.
 collapse_threshold_chars = 400
 max_output_tokens = 4096
 max_concurrent = 3
 search_timeout_seconds = 20
-# 带图联网通常更慢；仅图片请求使用这个总时限，纯文字仍使用上面的 20 秒。
+# Image search has a separate total timeout; text search keeps the shorter limit above.
 image_search_timeout_seconds = 30
-# 搜索超过 3 秒未完成时并发发起一次重试；设为 0 可关闭。
+# Start one parallel retry after this delay. Set to 0 to disable hedging.
 search_hedge_seconds = 3
 fallback_timeout_seconds = 10
 
@@ -40,13 +40,13 @@ ai_searching = "🔎 正在搜索…"
 ai_thinking = "💭 正在思考…"
 
 [quote]
-enabled = true
+enabled = false
 api_url = "http://127.0.0.1:3210/generate"
 timeout_seconds = 20
 max_messages = 5
 background_color = "#1b1429"
 sticker_set_short_name = ""
-# 启用后只存档新生成的 Q；按条数和总空间自动淘汰最旧记录。
+# When enabled, archive newly generated quotes and evict the oldest entries at either limit.
 history_enabled = false
 history_limit = 100
 history_max_bytes = 104857600

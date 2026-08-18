@@ -19,58 +19,65 @@
 
 ## 开始前
 
-当前部署脚本面向带 systemd 的 Linux 服务器。首次部署需要：
+Release 安装包面向带 systemd 且 glibc 不低于 2.35 的 64 位 Linux，支持 x86_64 和 ARM64。
+安装需要：
 
-- Docker、Docker Compose、Git 和 curl；
+- `curl`、`tar` 和 `sha256sum`；
 - 自己申请的 Telegram `api_id` 和 `api_hash`，申请方法见
   [Telegram 官方文档](https://core.telegram.org/api/obtaining_api_id)；
 - 一个使用 Gemini Interactions、OpenAI Chat Completions 或 OpenAI Responses 格式的 AI 接口，
   以及对应的模型和 API Key。
 
-以下命令都在仓库根目录执行。
+核心安装不需要 Rust、Cargo、Git 或 Docker。
 
-## 首次部署
+## 安装 Release
 
-先构建程序：
-
-```sh
-sudo scripts/server/build-container.sh
-```
-
-创建运行账号和目录，再安装示例配置：
+按当前 CPU 下载对应安装包，并校验 SHA-256：
 
 ```sh
-sudo useradd --system --home-dir /var/lib/telebot --shell "$(command -v nologin)" telebot
-sudo install -d -m 0755 /etc/telebot
-sudo install -d -o telebot -g telebot -m 0700 /var/lib/telebot
-sudo install -m 0644 config.example.toml /etc/telebot/config.toml
-sudo install -m 0600 deploy/telebot.env.example /etc/telebot/telebot.env
+case "$(uname -m)" in
+  x86_64) architecture=x86_64 ;;
+  aarch64|arm64) architecture=aarch64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+curl -fLO "https://github.com/KurisuT7/telebot/releases/latest/download/telebot-linux-$architecture.tar.gz"
+curl -fLO "https://github.com/KurisuT7/telebot/releases/latest/download/SHA256SUMS"
+grep " telebot-linux-$architecture.tar.gz$" SHA256SUMS | sha256sum --check -
+tar -xzf "telebot-linux-$architecture.tar.gz"
+cd "telebot-linux-$architecture"
 ```
 
-在 `/etc/telebot/config.toml` 中填写 `telegram.api_id` 和 AI 接口信息。在
-`/etc/telebot/telebot.env` 中填写 `TELEBOT_TELEGRAM_API_HASH` 以及配置文件中
-`ai.api_key_env` 指向的变量。不要把这两个文件、Telegram 会话或数据库提交到 Git。
-
-授权 Telegram 账号：
+创建运行账号、数据目录和配置文件：
 
 ```sh
-sudo scripts/server/login.sh
+sudo ./install.sh --prepare
+sudoedit /etc/telebot/config.toml
+sudoedit /etc/telebot/telebot.env
 ```
 
-按提示输入带国家代码的手机号和 Telegram 验证码。账号启用了两步验证时，还会要求输入密码。
-验证码和密码都不会显示在终端中。telebot 只登录已有账号，不能注册新账号。
+在 `config.toml` 中填写 `telegram.api_id`、`ai.api_format`、`ai.base_url` 和
+`ai.model`；在 `telebot.env` 中填写 `TELEBOT_TELEGRAM_API_HASH` 以及
+`ai.api_key_env` 指向的 AI Key 变量。
 
-最后安装本地语录渲染服务并部署 telebot：
+安装并启动：
 
 ```sh
-sudo scripts/server/install-quote-api.sh
-sudo scripts/server/deploy.sh first
-sudo systemctl enable telebot.service
-sudo scripts/server/status.sh
+sudo ./install.sh
 ```
 
-部署脚本会先检查配置，再切换到新版本。如果启动失败或 35 秒内没有出现
-`telebot is ready`，脚本会切回上一个版本。完整的更新、检查、备份和回滚步骤见
+安装器会检查配置，询问 Telegram 手机号和验证码，保存 Session，安装 systemd 服务并等待日志
+出现 `telebot is ready`。账号启用了两步验证时还会要求输入密码；验证码和密码均不回显。
+目前只能登录已有账号，不支持注册新账号或扫码登录。
+
+示例配置默认关闭语录渲染，因此上述核心安装不需要 Docker。若安装时需要启用 `.q`，先设置
+`quote.enabled = true`，再运行：
+
+```sh
+sudo ./install.sh --with-quote
+```
+
+这条可选路径需要 Docker、Docker Compose、Git 和 curl。源码构建见
+[参与开发](CONTRIBUTING.zh-CN.md#提交前检查)，升级、检查、备份和回滚见
 [运维文档](docs/operations.zh-CN.md)。
 
 ## Telegram 命令
@@ -173,10 +180,11 @@ TOML 并重启服务。
 
 ## 当前限制
 
-- 仓库提供的部署和运维脚本只面向 Linux、systemd 和 Docker。
+- Release 安装包和仓库提供的运维脚本只面向带 systemd 且 glibc 不低于 2.35 的 64 位
+  Linux，支持 x86_64 和 ARM64。
 - 登录支持手机号、验证码和 2FA 密码，暂不支持二维码登录或注册新账号。
 - Chat Completions 没有统一的联网搜索协议。
-- AI 图片输入只接受照片和静态贴纸；语录渲染需要单独运行 quote-api。
+- AI 图片输入只接受照片和静态贴纸；可选的语录渲染需要 quote-api 和 Docker。
 
 ## 项目文档
 

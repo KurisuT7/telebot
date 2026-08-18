@@ -10,7 +10,13 @@ case "$release_id" in
     ;;
 esac
 
-binary="$repo_root/target/release/telebot"
+if [ -n "${TELEBOT_BINARY:-}" ]; then
+  binary=$TELEBOT_BINARY
+elif [ -x "$repo_root/telebot" ]; then
+  binary="$repo_root/telebot"
+else
+  binary="$repo_root/target/release/telebot"
+fi
 release_dir="/opt/telebot/releases/$release_id"
 backup_dir="/var/backups/telebot/$release_id"
 config=/etc/telebot/config.toml

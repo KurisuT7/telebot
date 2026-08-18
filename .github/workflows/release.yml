@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            architecture: x86_64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            architecture: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Toolchain
+        run: rustup show
+      - name: Build package
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}"
+          sh scripts/release/package.sh "${{ matrix.target }}" "${{ matrix.architecture }}"
+          sh scripts/release/verify-package.sh \
+            "dist/telebot-linux-${{ matrix.architecture }}.tar.gz" \
+            "${{ matrix.architecture }}"
+          sh scripts/release/verify-prepare-install.sh \
+            "dist/telebot-linux-${{ matrix.architecture }}.tar.gz" \
+            "${{ matrix.architecture }}"
+          test "$(target/${{ matrix.target }}/release/telebot --version)" = \
+            "telebot ${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-${{ matrix.architecture }}
+          path: dist/telebot-linux-${{ matrix.architecture }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  draft-release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Inspect artifacts
+        run: |
+          test -f "docs/releases/${GITHUB_REF_NAME}.md"
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 2
+          (
+            cd dist
+            sha256sum *.tar.gz > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+          for archive in dist/*.tar.gz; do
+            tar -tzf "$archive"
+          done
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file "docs/releases/$GITHUB_REF_NAME.md"

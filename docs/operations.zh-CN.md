@@ -2,8 +2,9 @@
 
 简体中文 | [English](operations.md)
 
-本文档对应仓库提供的 Linux、systemd 和 Docker 部署脚本。除非命令中另有说明，以下操作都在
-仓库根目录执行，并使用 `sudo` 完成需要 root 权限的步骤。
+本文档对应带 systemd 且 glibc 不低于 2.35 的 64 位 Linux Release 安装包；Docker 只用于
+可选的语录渲染。除非命令中另有说明，以下操作都在解压后的 Release 目录执行，需要 root 权限
+的步骤使用 `sudo`。
 
 ## 文件位置
 
@@ -33,104 +34,73 @@
 telebot 可以通过手机号、验证码和 2FA 密码登录已有账号，但不能注册新账号，也暂不支持二维码
 登录。
 
-### 2. 构建
+### 2. 下载并校验
 
-主机需要 Docker，并且当前账号能够使用 Docker。构建脚本固定使用 Rust 1.90，依次运行格式
-检查、测试、Clippy 和 release 构建：
-
-```sh
-sudo scripts/server/build-container.sh
-```
-
-Cargo 下载和编译缓存位于 `/var/cache/telebot-build`。生成的程序会复制到
-`target/release/telebot`，命令最后会输出 SHA-256。
+按照[根 README](../README.zh-CN.md#安装-release)中的 CPU 判断、Release 下载和 SHA-256
+校验命令操作，然后进入解压后的目录。安装包支持 x86_64 和 ARM64 Linux，服务器不需要安装
+Rust 或 Cargo。
 
 ### 3. 创建运行账号和配置
 
 ```sh
-sudo useradd --system --home-dir /var/lib/telebot --shell "$(command -v nologin)" telebot
-sudo install -d -m 0755 /etc/telebot
-sudo install -d -o telebot -g telebot -m 0700 /var/lib/telebot
-sudo install -m 0644 config.example.toml /etc/telebot/config.toml
-sudo install -m 0600 deploy/telebot.env.example /etc/telebot/telebot.env
+sudo ./install.sh --prepare
+sudoedit /etc/telebot/config.toml
+sudoedit /etc/telebot/telebot.env
 ```
 
-如果 `telebot` 账号已经存在，不要重复执行 `useradd`。
+准备步骤会创建 `telebot` 运行账号、`/var/lib/telebot` 和两个配置文件，不会覆盖已有文件。
+至少填写：
 
-在 `/etc/telebot/config.toml` 中至少修改：
+- `config.toml` 中的 `telegram.api_id`、`ai.api_format`、`ai.base_url` 和 `ai.model`；
+- `telebot.env` 中的 `TELEBOT_TELEGRAM_API_HASH` 以及 `ai.api_key_env` 指向的 AI Key。
 
-- `telegram.api_id`；
-- `ai.api_format`、`ai.base_url` 和 `ai.model`；只有需要第二个搜索模型时才填写
-  `ai.search_fallback_model`；
-- 如果不使用 Gemini 示例，把 `ai.api_key_env` 改成自己的环境变量名。
+环境变量文件归 root 所有，权限为 `0600`。systemd 会在启动 telebot 前读取它，Key 不需要
+写进 TOML。
 
-在 `/etc/telebot/telebot.env` 中填写：
-
-- `TELEBOT_TELEGRAM_API_HASH`；
-- `ai.api_key_env` 指定的 AI Key 变量。
-
-环境变量文件的所有者应为 root，权限为 `0600`。systemd 会在启动 telebot 前读取它，Key
-不需要写进 TOML。
-
-### 4. 登录 Telegram
-
-运行登录脚本：
+### 4. 授权、部署和检查
 
 ```sh
-sudo scripts/server/login.sh
+sudo ./install.sh
 ```
 
-按提示输入带国家代码的手机号和 Telegram 验证码。账号启用了两步验证时，脚本还会要求输入
-2FA 密码。验证码和密码都不会显示在终端中。成功后会话保存在
-`/var/lib/telebot/telegram.session`，权限设为 `0600`。
+安装器会检查配置，询问 Telegram 手机号和验证码，安装带版本号的 release，启用 systemd 服务
+并等待日志出现 `telebot is ready`。账号启用了两步验证时还会询问 2FA 密码；验证码和密码均
+不回显。Session 保存在 `/var/lib/telebot/telegram.session`，权限为 `0600`。
 
-如果 telebot 服务正在运行，脚本会先停止服务，登录结束后再恢复；不要同时运行登录命令和
-`telebot.service`。会话已经有效时，命令会直接确认状态，不会再次发送验证码。
+部署过程会：
 
-已有 GramJS Session 的迁移方法单独放在[迁移说明](gramjs-migration.zh-CN.md)中，不影响新用户登录。
-
-### 5. 安装语录渲染服务
-
-```sh
-sudo scripts/server/install-quote-api.sh
-```
-
-脚本会检出 [LyoSU/quote-api](https://github.com/LyoSU/quote-api) 的固定提交，构建本地镜像，并启动
-`telebot-quote-api` 容器。服务只绑定 `127.0.0.1:3210`，没有持久卷；中文字体包含在镜像中。
-安装完成时会检查 `/health`。
-
-### 6. 部署并检查
-
-`release-id` 只能包含字母、数字、点、下划线和短横线：
-
-```sh
-sudo scripts/server/deploy.sh first
-sudo systemctl enable telebot.service
-sudo scripts/server/status.sh
-```
-
-部署脚本会：
-
-1. 把程序和运维文件复制到新的 release 目录；
+1. 把程序和运维文件复制到 `/opt/telebot/releases/v<version>/`；
 2. 读取环境变量并运行 `telebot validate`；
 3. 原子切换 `/opt/telebot/current`；
-4. 重启服务并等待日志出现 `telebot is ready`；
-5. 检查失败时切回先前版本。
+4. 重启服务并等待 `telebot is ready`；
+5. 检查失败时恢复先前版本。
 
-`status.sh` 应显示 `ActiveState=active`、`SubState=running`，quote renderer 的健康状态应为
-`ok`。
+已有 GramJS Session 的迁移方法单独放在[迁移说明](gramjs-migration.zh-CN.md)中，不影响新用户
+登录。
+
+### 5. 可选语录渲染
+
+示例配置为 `quote.enabled = false`。如果安装时需要启用 `.q`，修改该设置后运行：
+
+```sh
+sudo ./install.sh --with-quote
+```
+
+这条路径需要 Docker、Docker Compose、Git 和 curl。脚本会检出固定的
+`LyoSU/quote-api` 提交，构建本地镜像，启动只监听环回地址的服务，并检查
+`http://127.0.0.1:3210/health`。
 
 ## 更新
 
-更新代码后，重新构建并使用新的 release ID 部署：
+按 README 下载并校验新版本，解压后运行：
 
 ```sh
-sudo scripts/server/build-container.sh
-sudo scripts/server/deploy.sh 2026-08-17
-sudo scripts/server/status.sh
+cd "telebot-linux-$(uname -m)"
+sudo ./install.sh
 ```
 
-不要复用已经存在的 release ID。部署不会删除旧版本、配置、会话或 SQLite 数据。
+如果 ARM 系统的 `uname -m` 返回 `arm64`，解压目录仍是 `telebot-linux-aarch64`。每个版本
+使用独立 release 目录；安装不会删除旧版本、配置、Telegram Session 或 SQLite 数据。
 
 ## 日常检查
 

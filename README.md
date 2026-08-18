@@ -23,60 +23,67 @@ Telegram. Use only an account you control and follow the
 
 ## Prerequisites
 
-The supplied deployment scripts target a Linux server with systemd. A first deployment requires:
+The release packages target 64-bit Linux with systemd and glibc 2.35 or newer on x86_64 or ARM64.
+Installation requires:
 
-- Docker, Docker Compose, Git, and curl;
+- `curl`, `tar`, and `sha256sum`;
 - your own Telegram `api_id` and `api_hash` from the
   [official Telegram setup](https://core.telegram.org/api/obtaining_api_id);
 - an AI endpoint using Gemini Interactions, OpenAI Chat Completions, or OpenAI Responses, together
   with its model and API key.
 
-Run the commands below from the repository root.
+Rust, Cargo, Git, and Docker are not required for the core installation.
 
-## First deployment
+## Install a release
 
-Build telebot:
-
-```sh
-sudo scripts/server/build-container.sh
-```
-
-Create the service account and directories, then install the example configuration:
+Download the package for the current CPU and verify its checksum:
 
 ```sh
-sudo useradd --system --home-dir /var/lib/telebot --shell "$(command -v nologin)" telebot
-sudo install -d -m 0755 /etc/telebot
-sudo install -d -o telebot -g telebot -m 0700 /var/lib/telebot
-sudo install -m 0644 config.example.toml /etc/telebot/config.toml
-sudo install -m 0600 deploy/telebot.env.example /etc/telebot/telebot.env
+case "$(uname -m)" in
+  x86_64) architecture=x86_64 ;;
+  aarch64|arm64) architecture=aarch64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+curl -fLO "https://github.com/KurisuT7/telebot/releases/latest/download/telebot-linux-$architecture.tar.gz"
+curl -fLO "https://github.com/KurisuT7/telebot/releases/latest/download/SHA256SUMS"
+grep " telebot-linux-$architecture.tar.gz$" SHA256SUMS | sha256sum --check -
+tar -xzf "telebot-linux-$architecture.tar.gz"
+cd "telebot-linux-$architecture"
 ```
 
-Set `telegram.api_id` and the AI endpoint in `/etc/telebot/config.toml`. Set
-`TELEBOT_TELEGRAM_API_HASH` and the variable named by `ai.api_key_env` in
-`/etc/telebot/telebot.env`. Do not commit these files, a Telegram session, or the state database.
-
-Authorize the Telegram account:
+Create the service account, data directory, and configuration files:
 
 ```sh
-sudo scripts/server/login.sh
+sudo ./install.sh --prepare
+sudoedit /etc/telebot/config.toml
+sudoedit /etc/telebot/telebot.env
 ```
 
-Enter the phone number in international format and the Telegram login code. If the account uses
-two-step verification, telebot also asks for its password. The code and password are not echoed to
-the terminal. Login works with an existing Telegram account; it cannot register a new one.
+Set `telegram.api_id`, `ai.api_format`, `ai.base_url`, and `ai.model` in
+`config.toml`. Set `TELEBOT_TELEGRAM_API_HASH` and the AI key variable named by
+`ai.api_key_env` in `telebot.env`.
 
-Install the local quote renderer and deploy telebot:
+Install and start telebot:
 
 ```sh
-sudo scripts/server/install-quote-api.sh
-sudo scripts/server/deploy.sh first
-sudo systemctl enable telebot.service
-sudo scripts/server/status.sh
+sudo ./install.sh
 ```
 
-Deployment validates the configuration before switching releases. If startup fails or the process
-does not log `telebot is ready` within 35 seconds, the script restores the previous release. See the
-[operations guide](docs/operations.md) for updates, checks, backups, and rollback.
+The installer validates the configuration, asks for the Telegram phone number and login code, stores
+the resulting session, installs the systemd service, and waits for `telebot is ready`. A 2FA
+password is requested when needed; login codes and passwords are not echoed. Existing Telegram
+accounts are supported, but account registration and QR login are not.
+
+The example configuration leaves quote rendering disabled, so the path above does not require
+Docker. To enable `.q` during installation, set `quote.enabled = true` and run:
+
+```sh
+sudo ./install.sh --with-quote
+```
+
+That optional path requires Docker, Docker Compose, Git, and curl. Source builds are documented in
+[Contributing](CONTRIBUTING.md#development-checks). See the
+[operations guide](docs/operations.md) for upgrades, checks, backups, and rollback.
 
 ## Telegram commands
 
@@ -185,10 +192,12 @@ service account.
 
 ## Current limitations
 
-- The supplied deployment and operations scripts target Linux, systemd, and Docker.
+- Release packages and the supplied operations scripts target 64-bit Linux with systemd and glibc
+  2.35 or newer on x86_64 and ARM64.
 - Login supports a phone number, login code, and 2FA password, but not QR login or account registration.
 - Chat Completions has no standard native-search protocol.
-- AI image input is limited to photos and static stickers; quote rendering requires quote-api.
+- AI image input is limited to photos and static stickers; optional quote rendering requires
+  quote-api and Docker.
 
 ## Project documentation
 

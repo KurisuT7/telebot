@@ -2,8 +2,9 @@
 
 [简体中文](operations.zh-CN.md) | English
 
-This guide covers the repository's Linux, systemd, and Docker deployment path. Run commands from the
-repository root unless noted otherwise. Commands that require root privileges use `sudo`.
+This guide covers release-package operation on 64-bit Linux with systemd and glibc 2.35 or newer.
+Docker is used only by the optional quote renderer. Run commands from an extracted release directory
+unless noted otherwise. Commands that require root privileges use `sudo`.
 
 ## Files and directories
 
@@ -34,106 +35,76 @@ Create your own `api_id` and `api_hash` using the
 Telebot can authorize an existing account with its phone number, login code, and 2FA password. It
 cannot register a new account and does not currently support QR login.
 
-### 2. Build
+### 2. Download and verify
 
-The host needs Docker and permission to use it. The build script pins Rust 1.90 and runs formatting,
-tests, Clippy, and a release build:
-
-```sh
-sudo scripts/server/build-container.sh
-```
-
-Cargo downloads and build output are cached under `/var/cache/telebot-build`. The resulting binary is
-copied to `target/release/telebot`, and the command prints its SHA-256 digest.
+Follow the architecture detection, release download, and SHA-256 verification commands in the
+[root README](../README.md#install-a-release), then enter the extracted release directory. Release
+packages are provided for x86_64 and ARM64 Linux; they do not require Rust or Cargo on the server.
 
 ### 3. Create the service account and configuration
 
 ```sh
-sudo useradd --system --home-dir /var/lib/telebot --shell "$(command -v nologin)" telebot
-sudo install -d -m 0755 /etc/telebot
-sudo install -d -o telebot -g telebot -m 0700 /var/lib/telebot
-sudo install -m 0644 config.example.toml /etc/telebot/config.toml
-sudo install -m 0600 deploy/telebot.env.example /etc/telebot/telebot.env
+sudo ./install.sh --prepare
+sudoedit /etc/telebot/config.toml
+sudoedit /etc/telebot/telebot.env
 ```
 
-Skip `useradd` when the `telebot` account already exists.
+The prepare step creates the `telebot` service account, `/var/lib/telebot`, and both configuration
+files without overwriting existing files. At minimum, set:
 
-At minimum, change these values in `/etc/telebot/config.toml`:
+- `telegram.api_id`, `ai.api_format`, `ai.base_url`, and `ai.model` in `config.toml`;
+- `TELEBOT_TELEGRAM_API_HASH` and the AI key variable named by `ai.api_key_env` in `telebot.env`.
 
-- `telegram.api_id`;
-- `ai.api_format`, `ai.base_url`, and `ai.model`; set `ai.search_fallback_model` only when the second
-  search request should use a different model;
-- `ai.api_key_env` when the Gemini example variable is not appropriate.
-
-Set the following in `/etc/telebot/telebot.env`:
-
-- `TELEBOT_TELEGRAM_API_HASH`;
-- the AI key variable named by `ai.api_key_env`.
-
-The root-owned environment file remains mode `0600`. systemd reads it before starting telebot, so API
+The environment file is root-owned with mode `0600`. systemd reads it before starting telebot, so
 keys do not need to appear in TOML.
 
-### 4. Log in to Telegram
-
-Run the login wrapper:
+### 4. Authorize, deploy, and verify
 
 ```sh
-sudo scripts/server/login.sh
+sudo ./install.sh
 ```
 
-Enter the phone number in international format and the Telegram login code. When two-step
-verification is enabled, the wrapper also asks for the 2FA password. Neither the code nor the password
-is echoed. The resulting session is stored at `/var/lib/telebot/telegram.session` with mode `0600`.
+The installer validates the files, requests the Telegram phone number and login code, installs a
+versioned release, enables the systemd service, and waits for `telebot is ready`. When two-step
+verification is enabled, it also requests the 2FA password. Neither the code nor password is echoed.
+The resulting session is stored at `/var/lib/telebot/telegram.session` with mode `0600`.
 
-If `telebot.service` is active, the wrapper stops it before login and starts it again afterward. Do
-not run the underlying login command beside the service. An already authorized session is reported
-without sending another login code.
+Deployment:
+
+1. copies the binary and operations files into `/opt/telebot/releases/v<version>/`;
+2. loads the environment and runs `telebot validate`;
+3. atomically switches `/opt/telebot/current`;
+4. restarts the service and waits for `telebot is ready`;
+5. restores the previous release if the checks fail.
 
 Existing GramJS sessions can be imported by following the separate
 [migration guide](gramjs-migration.md). That path is not part of a new installation.
 
-### 5. Install the quote renderer
+### 5. Optional quote renderer
+
+The example configuration has `quote.enabled = false`. To enable `.q` during installation, change
+that setting and run:
 
 ```sh
-sudo scripts/server/install-quote-api.sh
+sudo ./install.sh --with-quote
 ```
 
-The script fetches the pinned `LyoSU/quote-api` commit recorded in the repository, builds a local
-image, and starts the `telebot-quote-api` container. The service binds only to `127.0.0.1:3210`, has no
-persistent volume, and includes CJK fonts in the image. Installation finishes with a `/health` check.
-
-### 6. Deploy and verify
-
-The release ID may contain only letters, numbers, dots, underscores, and hyphens:
-
-```sh
-sudo scripts/server/deploy.sh first
-sudo systemctl enable telebot.service
-sudo scripts/server/status.sh
-```
-
-Deployment:
-
-1. copies the binary and operations files into a new release directory;
-2. loads the environment and runs `telebot validate`;
-3. atomically switches `/opt/telebot/current`;
-4. restarts the service and waits for `telebot is ready` in the journal;
-5. restores the previous release if the checks fail.
-
-`status.sh` should report `ActiveState=active`, `SubState=running`, and quote renderer health `ok`.
+This path requires Docker, Docker Compose, Git, and curl. It fetches the pinned
+`LyoSU/quote-api` commit, builds a local image, starts a loopback-only service, and checks
+`http://127.0.0.1:3210/health`.
 
 ## Updates
 
-After updating the source, rebuild and deploy with a new release ID:
+Download and verify the newer release as described in the README, extract it, and run:
 
 ```sh
-sudo scripts/server/build-container.sh
-sudo scripts/server/deploy.sh 2026-08-17
-sudo scripts/server/status.sh
+cd "telebot-linux-$(uname -m)"
+sudo ./install.sh
 ```
 
-Do not reuse an existing release ID. Deployment does not remove older releases, configuration,
-sessions, or SQLite state.
+For ARM systems that report `arm64`, the extracted directory is `telebot-linux-aarch64`. Each
+version uses a distinct release directory. Installation does not remove older releases,
+configuration, Telegram authorization, or SQLite state.
 
 ## Routine checks
 

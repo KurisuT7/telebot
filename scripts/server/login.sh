@@ -6,6 +6,8 @@ config=${TELEBOT_CONFIG:-/etc/telebot/config.toml}
 environment=${TELEBOT_ENVIRONMENT:-/etc/telebot/telebot.env}
 if [ -n "${TELEBOT_BINARY:-}" ]; then
   binary=$TELEBOT_BINARY
+elif [ -x "$repo_root/telebot" ]; then
+  binary="$repo_root/telebot"
 elif [ -x "$repo_root/target/release/telebot" ]; then
   binary="$repo_root/target/release/telebot"
 else
